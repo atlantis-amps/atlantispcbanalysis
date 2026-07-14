@@ -1,0 +1,2393 @@
+---
+title: "Read PCB data"
+author: "H Morzaria-Luna"
+date: "2025-05-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+remotes::install_github(c("ropensci/tabulapdf"))
+usethis::use_package("daiR")
+usethis::use_package("tesseract")
+usethis::use_package("googlesheets4")
+usethis::use_package("dplyr")
+library(magrittr)
+devtools::load_all()
+```
+
+## Import PDF data from West et al. 2001
+West, J., S. O’Neill, G. Lippert, and S. Quinnell. 2001. Toxic contaminants in marine and anadromous fishes from Puget Sound, Washington. Washington Department of Fish and Wildlife, Olympia, Washington.
+
+Time trends of persistent organic pollutants in benthic and pelagic indicator fishes from Puget Sound
+
+```{r split_pdf, echo=FALSE}
+
+#Split PDF in single pages needed for daiR package
+
+savedir.pdf <- "~/readpcbpdfs/inputs/west2001"
+dir.create(savedir.pdf)
+
+pdf.list <- list.files(savedir.pdf, pattern = "*.*pdf", full.names = TRUE)
+
+if(rlang::is_empty(pdf.list)==TRUE) {
+
+tabulapdf::split_pdf("~/readpcbpdfs/inputs/tables_West_2001.pdf", outdir = savedir.pdf)
+  
+}
+
+
+#tables have text with species names that was not straightforward to extract
+# so I extracted it manually
+
+googlesheets4::gs4_deauth()
+species.link <- "1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU"
+sp.sheet <- googlesheets4::read_sheet(species.link, sheet="species")
+
+func.groups <- sp.sheet %>% 
+  dplyr::distinct(common_name, functional_group)
+
+# Use tidyverse to repeat each row the appropriate number of times
+sp.sheet.expanded <- sp.sheet %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(row = list(rep(1:pages, each=1))) %>%
+  tidyr::unnest(row) %>%
+  dplyr::select(-pages)
+
+# Write the resulting DataFrame to a new CSV file
+readr::write_csv(sp.sheet.expanded, "species_samples.csv")
+
+
+#not needed once the whole data.frame was expanded
+#sp.list <- lapply(num.rows, get_sp, sp.sheet)
+#sp.names <- purrr::list_c(sp.list)
+
+#Extract tables
+
+savedir.pdf <- "~/readpcbpdfs/inputs/west2001"
+
+pdf.list <- list.files(savedir.pdf, pattern = "*.*pdf", full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+#This function extracts all text from the PDF
+#ocr.text <- pdftools::pdf_ocr_text(pdf.list[1])
+
+tables.file <- lapply(no.pdf.files, get_table_west, pdf.list, sp.sheet.expanded) 
+
+pdf.dirname <- "west2001"
+
+tables.raw <- tables.file %>% 
+  dplyr::bind_rows() %>% 
+  dplyr::filter(grepl("PCB", `Assay`)) %>% 
+  dplyr::mutate(PCB_congener= gsub("PCB","",Assay), unit = "ug/kg") %>% 
+  dplyr::select(Location, common_name, PCB_congener, unit, sample, Mean)
+
+tables.summary <- tables.raw %>% 
+  tidyr::pivot_wider(names_from = PCB_congener, values_from = Mean) %>% 
+  dplyr::mutate(citation=pdf.dirname, sample_no = 1:dplyr::n()) %>% 
+  dplyr::rename(location = Location, tot_pcb=Total) %>% 
+  dplyr::left_join(func.groups, by = "common_name") %>% 
+  dplyr::select(citation, sample_no, location, common_name, functional_group, sample, dplyr::everything())
+  
+
+#write and read again to make data as double
+readr::write_csv(tables.summary, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+sed.csv <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+#saved locations, added corresponding Atlantis polygon
+locs.west <- sed.csv %>% 
+  dplyr::distinct(location)
+
+readr::write_csv(locs.west, here::here("outputs",paste0("locations_",pdf.dirname,".csv")))
+
+tables.data <- sed.csv %>% 
+ dplyr::mutate(dplyr::across(tidyr::everything(), ~tidyr::replace_na(.x, 0))) 
+
+#write again to add 0 values
+readr::write_csv(tables.data, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+googlesheets4::gs4_deauth()
+species.link <- "1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU"
+loc.sheet <- googlesheets4::read_sheet(species.link, sheet="west2001_locations", col_types = c("ci"))
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+#could not add the coeluting congeners because they were not reported in the results, they only include the most common data
+tables.selec <- tables.data %>% 
+  dplyr::left_join(loc.sheet, by="location") %>% 
+  dplyr::filter(!is.na(atlantis_polygon)) %>% 
+    dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=(`153`)/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`138`)/tot_pcb, per_138=ratio_138*100,
+                strata = "sampling location", year = "1989-1999") %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() +
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "West et al. 2001",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+# tried package daiR which uses Google Document AI OCR but it could not distinguish the two first columns
+# https://dair.info/articles/tables.html
+#processors <- daiR::create_processor("atlantis-pcb-table-processor", type = "FORM_PARSER_PROCESSOR")
+#tables.raw <- daiR::dai_sync(pdf.list[1], proc_id = "6e5afc64cb0fea45")
+#tables.extracted <- daiR::get_tables(tables.raw)
+
+```
+
+#Extract 
+Burd, B. J., T. A. Macdonald, R. W. Macdonald, and P. S. Ross. 2014. Distribution and uptake of key polychlorinated biphenyl and polybrominated diphenyl ether congeners in benthic infauna relative to sediment organic enrichment. Archives of environmental contamination and toxicology 67:310–334.
+
+```{r}
+
+#Split PDF in single pages needed 
+
+pdf.filename <- "tables_Burd_2014.pdf"
+
+pdf.dirname <- "burd2014"
+
+split_pdf(pdf.filename, pdf.dirname)
+
+#Extract tables
+
+pdf.list <- list.files(here::here("inputs",pdf.dirname), pattern = "*.*pdf", full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+#Had to use extract:areas because it thinks the PDF area is empty
+#It is interactive so had to use a for loop
+
+table.data <- list()
+
+for(eachpdf in no.pdf.files){
+ 
+print(eachpdf)
+this.pdf <- pdf.list[eachpdf]
+
+print(this.pdf)
+
+tables.file <- tabulapdf::extract_areas(this.pdf)
+ 
+print(tables.file)
+
+table.data[[eachpdf]] <- tables.file
+  
+}
+ 
+this.colnames.1 <- table.data[[1]][[1]][1,] %>% 
+   tidyr::separate(col=`PCB Congener`, into=c("28","31"), sep=" ") %>% 
+  as.character()
+
+secc.1.1 <- table.data[[1]][[1]][2:19,] %>% 
+  tidyr::separate(col=`PCB Congener`, into=c("28","31"), sep=" ") %>% 
+  setNames(this.colnames.1) %>% 
+  dplyr::select(-`NA`) %>% 
+  dplyr::rename(station=Station)
+
+this.colnames.2 <- table.data[[1]][[1]][21,] %>% 
+    tidyr::separate(col=`...10`, into=c("110","118"), sep=" ") %>% 
+  as.character()
+
+secc.1.2 <- table.data[[1]][[1]][22:39,] %>% 
+  tidyr::separate(col=`...10`, into=c("110","118"), sep=" ") %>% 
+  setNames(this.colnames.2) %>% 
+  dplyr::select(-`NA`) %>% 
+  dplyr::rename(station=`Station`)
+
+this.colnames.3 <- as.character(table.data[[1]][[1]][41,])
+
+secc.1.3 <- table.data[[1]][[1]][42:48,] %>% 
+  setNames(this.colnames.3) %>% 
+  dplyr::select(-`% TOC`, -`% Fines`,-`AVS (umol/g)`) %>% 
+  dplyr::rename(station=`Station`, tot_pcb=Sum)
+
+this.colnames.4 <- as.character(table.data[[2]][[1]][1,])
+
+secc.1.4 <- table.data[[2]][[1]][2:12,] %>% 
+  setNames(this.colnames.4) %>% 
+  dplyr::select(-`NA`,-`% TOC`, -`% Fines`,-`AVS (umol/g)`) %>% 
+  dplyr::rename(station=`Station`, tot_pcb=Sum)
+
+this.colnames.5 <- as.character(table.data[[2]][[1]][14,c(1:4,7:11)])
+
+secc.1.5 <- table.data[[2]][[1]][15:33,c(1:4,7:11)] %>% 
+  setNames(this.colnames.5) %>% 
+  dplyr::rename(station=`Station`) %>% 
+  dplyr::mutate_if(is.numeric, as.character)
+
+this.colnames.6 <- as.character(table.data[[2]][[1]][35,c(1:4,7:11)])
+
+secc.1.6 <- table.data[[2]][[1]][36:48,c(1:4,7:11)] %>% 
+  setNames(this.colnames.6) %>% 
+  dplyr::rename(station=`Station`) %>% 
+  dplyr::mutate_if(is.numeric, as.character)
+
+this.colnames.7 <- as.character(table.data[[3]][[1]][1,c(1:4,6,8,10:12)])
+
+secc.1.7 <- table.data[[3]][[1]][2:7,c(1:4,6,8,10:12)] %>% 
+  setNames(this.colnames.7) %>% 
+  dplyr::rename(station=`Station`) %>% 
+  dplyr::mutate_if(is.numeric, as.character)
+
+this.colnames.8 <- as.character(table.data[[3]][[1]][9,c(1:4,6,8,10:12)])
+
+secc.1.8 <- table.data[[3]][[1]][10:28,c(1:4,6,8,10:12)] %>% 
+  setNames(this.colnames.8) %>% 
+  dplyr::rename(station=`Station`) %>% 
+  dplyr::rename(tot_pcb = Sum) %>% 
+  dplyr::mutate_if(is.numeric, as.character)
+
+this.colnames.9 <- as.character(table.data[[3]][[1]][30,c(1:5,7,9:12)])
+
+secc.1.9 <- table.data[[3]][[1]][31:47,c(1:5,7,9:12)] %>% 
+  setNames(this.colnames.9) %>% 
+  dplyr::rename(station=`Station`) %>% 
+  dplyr::mutate_if(is.numeric, as.character)
+
+this.colnames.10 <- as.character(table.data[[4]][[1]][1,c(1:4,6,8,10,12,14:15)])
+
+secc.1.10 <- table.data[[4]][[1]][2:3,c(1:4,6,8,10,12,14:15)] %>% 
+  setNames(this.colnames.10) %>% 
+  dplyr::rename(station=`Station`) %>% 
+  dplyr::mutate_if(is.numeric, as.character)
+
+this.colnames.10 <- as.character(table.data[[4]][[1]][1,c(1:4,6,8,10,12,14:15)])
+
+secc.1.10 <- table.data[[4]][[1]][2:3,c(1:4,6,8,10,12,14:15)] %>% 
+  setNames(this.colnames.10) %>% 
+  dplyr::rename(station=`Station`) %>% 
+  dplyr::mutate_if(is.numeric, as.character)
+
+this.colnames.11 <- as.character(table.data[[4]][[1]][5,c(1:4,6,8,10,12,14:15)])
+
+secc.1.11 <- table.data[[4]][[1]][6:24,c(1:4,6,8,10,12,14:15)] %>% 
+  setNames(this.colnames.11) %>% 
+  dplyr::rename(station=`Station`) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>% 
+  dplyr::select(-`118`)
+
+this.colnames.12 <- as.character(table.data[[4]][[1]][26,c(1:3,5,7,9,11,13,15)])
+
+secc.1.12 <- table.data[[4]][[1]][27:45,c(1:3,5,7,9,11,13,15)] %>% 
+  setNames(this.colnames.12) %>% 
+  dplyr::rename(station=`Station`, tot_pcb = Sum) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>% 
+  dplyr::select(-`% Lipid`)
+  
+#there are duplicate rows in the tables themselves
+
+sed.tab <- dplyr::bind_cols(secc.1.1, secc.1.2, dplyr::bind_rows(secc.1.3, secc.1.4))  %>% 
+  dplyr::rename(station=`station...1`) %>% 
+  dplyr::select(-`station...11`,-`station...21`) %>% 
+  dplyr::mutate(citation=pdf.dirname, sample_no = 1:dplyr::n(), sample = "sediment", unit = "pg/g dw") %>% 
+  dplyr::mutate_if(is.numeric, as.character) 
+
+com.tab1 <- dplyr::bind_cols(secc.1.5, dplyr::bind_rows(secc.1.6, secc.1.7), secc.1.8)  %>% 
+  dplyr::rename(station=`station...1`) %>% 
+  dplyr::select(-`station...10`,-`station...19`) %>% 
+  dplyr::mutate(citation=pdf.dirname, sample_no = 1:dplyr::n(), sample = "benthic infauna tissue", unit = "pg/g dw") %>% 
+  dplyr::mutate_if(is.numeric, as.character) 
+ 
+com.tab2 <- dplyr::bind_cols(dplyr::bind_rows(secc.1.9, secc.1.10), secc.1.11, secc.1.12)  %>% 
+  dplyr::rename(station=`station...1`) %>% 
+  dplyr::select(-`station...11`,-`station...20`) %>% 
+  dplyr::mutate(citation=pdf.dirname, sample_no = 1:dplyr::n(), sample = "benthic infauna tissue", unit = "pg/g dw") %>% 
+  dplyr::mutate_if(is.numeric, as.character) 
+
+googlesheets4::gs4_deauth()
+species.link <- "1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU"
+loc.sheet <- googlesheets4::read_sheet(species.link, sheet="burd2014", col_types = c("cccd"))
+
+all.samples <- dplyr::bind_rows(sed.tab, com.tab1, com.tab2) %>% 
+  dplyr::left_join(loc.sheet, by = "station") %>% 
+  dplyr::filter(!is.na(atlantis_polygon)) 
+
+#write and read again to make data as double
+readr::write_csv(all.samples, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+all.samples <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+#could not add the coeluting congeners because they were not reported in the results, they only include the most common data
+
+tables.selec <- all.samples %>% 
+    dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=(`153`)/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`138/164`)/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::mutate(functional_group = dplyr::if_else(sample=="sediment","sediment",c("BIV, PWN, BML, BMD, BFF, BC, BD"))) %>% 
+  dplyr::mutate(strata = "sampling locations", year = "2010-2012") %>% 
+  dplyr::mutate(common_name = dplyr::if_else(sample=="sediment","sediment","benthic invertebrates")) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb) %>% 
+  dplyr::distinct(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, ratio_118, per_118, ratio_153, per_153, ratio_138, per_138, tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() +
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Burd et al. 2014",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+  
+                      
+```
+
+
+#Extract 
+Conn, K.E., and Black, R.W., 2014, Data compilation for assessing sediment and toxic chemical loads from the Green River to the lower Duwamish Waterway, Washington: U.S. Geological Survey Data Series 880, 46 p., http://dx.doi. org/10.3133/ds880.
+
+```{r}
+#stored in Google sheets
+
+pdf.dirname <- "conn2014"
+googlesheets4::gs4_deauth()
+  
+sheet.link <- "https://docs.google.com/spreadsheets/d/1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU/edit?gid=385519610#gid=385519610"
+
+sed.bed <- googlesheets4::read_sheet(sheet.link, sheet = "conn_&_black_sed_bed") %>% 
+  dplyr::filter(grepl("PCB", `Parameter Name`)) %>% 
+  dplyr::select(sample, `Parameter Name`, dplyr::contains("Result")) %>% 
+  tidyr::pivot_longer(cols=3:ncol(.), names_to = "date", values_to = "value") %>% 
+  tidyr::separate(`Parameter Name`, into=c("PCB","pcb_congener"), sep="-") %>% 
+  tidyr::pivot_wider(names_from = pcb_congener) %>% 
+  dplyr::mutate(tot_pcb = rowSums(dplyr::across(dplyr::where(is.numeric)), na.rm=TRUE)) %>% 
+  dplyr::mutate(functional_group=sample, sample = "sediment")
+
+sed.susp <- googlesheets4::read_sheet(sheet.link, sheet = "conn_&_black_susp_sed") %>% 
+  dplyr::filter(grepl("PCB", `Parameter Name`)) %>% 
+  dplyr::select(sample, `Parameter Name`, dplyr::contains("Result")) %>% 
+  tidyr::pivot_longer(cols=3:ncol(.), names_to = "date", values_to = "value") %>% 
+  tidyr::separate(`Parameter Name`, into=c("PCB","pcb_congener"), sep="-") %>% 
+  tidyr::pivot_wider(names_from = pcb_congener) %>% 
+  dplyr::mutate(tot_pcb = rowSums(dplyr::across(dplyr::where(is.numeric)), na.rm=TRUE)) %>% 
+  dplyr::mutate(functional_group=sample, sample = "sediment")
+
+water <- googlesheets4::read_sheet(sheet.link, sheet = "conn_&_black_water") %>% 
+  dplyr::filter(grepl("PCB", `Parameter Name`)) %>% 
+  dplyr::select(sample, `Parameter Name`, dplyr::contains("Result")) %>% 
+  tidyr::pivot_longer(cols=3:ncol(.), names_to = "date", values_to = "value") %>% 
+  tidyr::separate(`Parameter Name`, into=c("PCB","pcb_congener"), sep="-") %>% 
+  tidyr::pivot_wider(names_from = pcb_congener) %>% 
+  dplyr::mutate(tot_pcb = rowSums(dplyr::across(dplyr::where(is.numeric)), na.rm=TRUE)) %>% 
+  dplyr::mutate(functional_group=sample, sample = "water")
+
+pcb.samp <- dplyr::bind_rows(sed.bed, sed.susp, water) 
+  
+
+readr::write_csv(pcb.samp, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+tables.selec <- pcb.samp %>% 
+  dplyr::mutate(atlantis_polygon = "45", common_name = sample, unit = "pg/g", strata="sampling dates", year = "2013") %>%  #sampled in the Duwamish River
+  dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=`153/168`/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`129/138/160/163`+`164`)/tot_pcb, per_138=ratio_138*100, 
+                citation=pdf.dirname, sample_no = 1:dplyr::n(), strata="sampling location & date") %>% 
+   dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() +
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Conn et al. 2014",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+
+```
+
+
+#Extract
+WADOE, 2015. Bellingham Bay Regional Background Sediment Characterization. Washington State Department of Ecology Toxics Cleanup Program Olympia, WA.
+
+```{r}
+
+pdf.filename <- "tables_WDOE_2015"
+
+pdf.dirname <- "wdoe2015"
+
+split_pdf(pdf.filename, pdf.dirname)
+
+#Extract tables
+
+pdf.list <- list.files(here::here("inputs", pdf.dirname), pattern = "*.*pdf", full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+#DO NOT SELECT table captions
+
+tables.file <- lapply(no.pdf.files, get_table, pdf.list, pdf.dirname) 
+
+
+tables.data.1 <- dplyr::bind_rows(tables.file[[1]],tables.file[[2]],tables.file[[3]]) %>% 
+  dplyr::rename(pcb_congener = `Location ID`) %>% 
+  dplyr::filter(!grepl("TEQ", pcb_congener)) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.),names_to="station", values_to = "value") %>% 
+  dplyr::filter(!grepl("Q...", station)) %>% 
+  dplyr::mutate(pcb_congener= gsub("PCB‐","",pcb_congener)) %>% 
+  dplyr::mutate(pcb_congener= gsub("Total PCBs\\*","tot_pcb",pcb_congener), value= gsub(" UJ","",value), value= gsub(" J","",value), value= gsub(" U","",value)) %>% 
+  dplyr::arrange(station, pcb_congener) %>% 
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>%
+  dplyr::mutate(citation=pdf.dirname, sample_no = 1:dplyr::n()) 
+
+
+tables.data.2 <- dplyr::bind_rows(tables.file[[4]],tables.file[[5]],tables.file[[6]]) %>% 
+  dplyr::rename(pcb_congener = `Location ID`) %>% 
+  dplyr::mutate(`Location ID BB‐07‐S Q`= gsub("Total PCBs\\*","tot_pcb",`Location ID BB‐07‐S Q`)) %>% 
+  tidyr::separate("Location ID BB‐07‐S Q", into=c("BB‐07‐S","value"), sep=" ") %>%
+  dplyr::mutate(`BB‐07‐S Q`=dplyr::if_else(is.na(`value`), `BB‐07‐S Q`, `value`),
+                pcb_congener=dplyr::if_else(is.na(pcb_congener), `BB‐07‐S`, pcb_congener)) %>% 
+  dplyr::filter(pcb_congener!="PCB") %>% 
+  dplyr::select(-`BB‐07‐S`, -`...3`, -`...4`, -`...8`, -value, -dplyr::contains("Q...")) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.),names_to="station", values_to = "value") %>% 
+  dplyr::mutate(pcb_congener= gsub("PCB‐","",pcb_congener), station= gsub(" Q","",station), station= gsub("Q ","",station)) %>% 
+  dplyr::mutate(value= gsub(" UJ","",value), value= gsub(" J","",value), value= gsub(" U","",value), value= gsub("J ","",value), value= gsub("U ","",value)) %>% 
+  dplyr::arrange(station, pcb_congener) %>% 
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>%
+  dplyr::mutate(citation=pdf.dirname, sample_no = 1:dplyr::n()) 
+
+
+tables.data.3 <- dplyr::bind_rows(tables.file[[7]],tables.file[[8]],tables.file[[9]]) %>% 
+  dplyr::rename(pcb_congener = `Location ID`) %>% 
+  dplyr::filter(!grepl("TEQ", pcb_congener)) %>% 
+  dplyr::select(-`...4`, -`...9`, -dplyr::contains("Q...")) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.),names_to="station", values_to = "value") %>% 
+  dplyr::mutate(pcb_congener= gsub("PCB‐","",pcb_congener), station= gsub(" Q","",station), station= gsub("Q ","",station)) %>% 
+  dplyr::mutate(value= gsub(" UJ","",value), value= gsub(" J","",value), value= gsub(" U","",value), value= gsub("J ","",value), value= gsub("U ","",value)) %>% 
+  dplyr::arrange(station, pcb_congener) %>% 
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>%
+  dplyr::mutate(citation=pdf.dirname, sample_no = 1:dplyr::n()) %>% 
+  dplyr::rename(tot_pcb="Total PCBs*")
+  
+tables.data.4 <- dplyr::bind_rows(tables.file[[10]],tables.file[[11]],tables.file[[12]]) %>% 
+  dplyr::rename(pcb_congener = `Location ID`) %>% 
+  dplyr::mutate(`Q BB‐20‐S`=dplyr::if_else(!is.na(`...3`), `...3`, `Q BB‐20‐S`),
+             `Q BB‐20‐S`= gsub("U ","",`Q BB‐20‐S`), `Q BB‐20‐S`= gsub("J ","",`Q BB‐20‐S`)) %>% 
+  dplyr::mutate(`Location ID BB‐19‐S`= gsub("Total PCBs\\*","tot_pcb",`Location ID BB‐19‐S`)) %>% 
+  tidyr::separate("Location ID BB‐19‐S", into=c("BB‐19‐S_val","value"), sep=" ") %>%
+  dplyr::mutate(`BB‐19‐S`=dplyr::if_else(is.na(`value`), `BB‐19‐S`, `value`),
+                pcb_congener=dplyr::if_else(is.na(pcb_congener), `BB‐19‐S_val`, pcb_congener)) %>% 
+  dplyr::filter(pcb_congener!="PCB") %>% 
+  dplyr::select(-`BB‐19‐S_val`, -`...7`, -`...3`, -value, -dplyr::contains("Q...")) %>% 
+ tidyr::pivot_longer(cols=2:ncol(.),names_to="station", values_to = "value") %>% 
+  dplyr::mutate(pcb_congener= gsub("PCB‐","",pcb_congener), station= gsub(" Q","",station), station= gsub("Q ","",station)) %>% 
+  dplyr::mutate(value= gsub(" UJ","",value), value= gsub(" J","",value), value= gsub(" U","",value), value= gsub("J ","",value), value= gsub("U ","",value)) %>% 
+  dplyr::arrange(station, pcb_congener) %>% 
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>%
+  dplyr::mutate(citation=pdf.dirname, sample_no = 1:dplyr::n()) 
+  
+tables.data.5 <- dplyr::bind_rows(tables.file[[13]],tables.file[[14]],tables.file[[15]]) %>% 
+  dplyr::rename(pcb_congener = `Location ID`) %>% 
+  dplyr::filter(!grepl("TEQ", pcb_congener)) %>% 
+  dplyr::mutate(`pcb_congener`= gsub("Total PCBs\\*","tot_pcb",`pcb_congener`)) %>% 
+  dplyr::mutate(`Q BB‐25‐S`=dplyr::if_else(is.na(`Q BB‐25‐S`), `BB‐24‐D`, `Q BB‐25‐S`),
+                `BB‐24‐D`=dplyr::if_else(is.na(`...6`), `Q...3`, `BB‐24‐D`),
+                `BB‐26‐S Q`=dplyr::if_else(is.na(`BB‐26‐S Q`), `Q...5`, `BB‐26‐S Q`), 
+                `BB‐27‐S`=dplyr::if_else(`BB‐27‐S`==0, `BB‐25‐S`, `BB‐27‐S`)) %>% 
+    dplyr::select(-`BB‐25‐S`, -`...6`, -`...10`, -`BB‐26‐S`, -dplyr::contains("Q...")) %>% 
+    tidyr::pivot_longer(cols=2:ncol(.),names_to="station", values_to = "value") %>% 
+    dplyr::mutate(pcb_congener= gsub("PCB‐","",pcb_congener), station= gsub(" Q","",station), station= gsub("Q ","",station)) %>% 
+  dplyr::mutate(value= gsub(" UJ","",value), value= gsub(" J","",value), value= gsub(" U","",value), value= gsub("J ","",value), value= gsub("U ","",value), value= gsub("U","",value), value= gsub("J","",value)) %>% 
+  dplyr::arrange(station, pcb_congener) %>% 
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>%
+  dplyr::mutate(citation=pdf.dirname, sample_no = 1:dplyr::n()) 
+
+
+tables.data.6 <- dplyr::bind_rows(tables.file[[16]],tables.file[[17]],tables.file[[18]]) %>% 
+  dplyr::rename(pcb_congener = `Location ID`) %>% 
+  dplyr::filter(!grepl("TEQ", pcb_congener)) %>% 
+  dplyr::filter(pcb_congener!="*") %>%
+  dplyr::mutate(pcb_congener =gsub("Total PCBs\\*","tot_pcb", pcb_congener)) %>% 
+  dplyr::select(-`...5`, -dplyr::contains("Q...")) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.),names_to="station", values_to = "value") %>% 
+  dplyr::mutate(pcb_congener= gsub("PCB‐","",pcb_congener), station= gsub(" Q","",station), station= gsub("Q ","",station)) %>% 
+  dplyr::mutate(value= gsub(" UJ","",value), value= gsub(" J","",value), value= gsub(" U","",value), value= gsub("J ","",value), value= gsub("U ","",value), value= gsub("U","",value), value= gsub("J","",value)) %>% 
+  dplyr::arrange(station, pcb_congener) %>% 
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>%
+  dplyr::mutate(citation=pdf.dirname, sample_no = 1:dplyr::n()) 
+
+#read coordinate table 
+  
+coord.pdf <- here::here("inputs","tables_coords_WDOE_2015.pdf")
+
+coords.file <- tabulapdf::extract_tables(coord.pdf) %>% 
+  .[[1]] %>%
+  .[5:nrow(.),] %>% 
+  dplyr::select(`...1`,`...5`,`...6`) %>% 
+  dplyr::rename(station=`...1`,lat=`...5`,lon=`...6`)
+
+# Assuming your data frame is named 'my_data' and has columns 'longitude' and 'latitude'
+atlantis.pol <- sf::st_read(here::here("inputs","AMPS_shapefile","bgm_Puget_Sound_89b_0p0001_WGS84.shp"))
+
+coords.sf <- st_as_sf(coords.file, coords = c("lon", "lat"), crs = 4326)
+#all sampling sites are in Bellingham polygon 9
+
+all.samples <- dplyr::bind_rows(tables.data.1, tables.data.2, tables.data.3, tables.data.4, tables.data.5, tables.data.6) %>% 
+  dplyr::mutate(unit = "ng/kg DW", year = "2014", common_name = "sediment", functional_group = "sediment", citation=pdf.dirname, sample_no = 1:dplyr::n(), sample="sediment", strata = "sampling locations & date", atlantis_polygon=9) %>% 
+  dplyr::mutate(station= gsub(" Q","", station))
+
+#write and read again to make data as double
+readr::write_csv(all.samples, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+all.samples <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+#calculate ratios
+
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+
+tables.selec <- all.samples %>% 
+    dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=`153/168`/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`129/138/160/163`+`164`)/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() +
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "WDOE et al. 2015",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+
+```
+
+#Extract
+Location Point Grey
+Ross, P. S., K.A. Harris, N.J. Dangerfield, N.F. Crewe, C. Dubetz, M.B. Fischer, T.L. Fraser, and A.R.S. Ross 2011. Sediment concentrations of PCBs, PBDEs, PCDDs and PCDFs from disposal at sea sites at Point Grey and Sand Heads, British Columbia in 2010. Fisheries and Oceans Canada, Ottawa, Canada. Canadian Data Report of Fisheries and Aquatic Sciences 1239.
+
+```{r}
+
+pdf.filename <- "tables_Ross_2011_1.pdf"
+
+pdf.dirname <- "ross2011_1"
+
+split_pdf(pdf.filename, pdf.dirname)
+
+#Extract tables
+pdf.list <- list.files(here::here("inputs", pdf.dirname), pattern = "tables_Ross", full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+tables.file <- lapply(no.pdf.files, get_table, pdf.list, pdf.dirname) 
+
+no.tables <- 1:length(tables.file)
+
+
+#need to run this separately because there are actually two tables
+rm(eachtable)
+rm(current.table)
+
+no.tables <- 1:14
+for(eachtable in no.tables){
+  
+   
+  thistable <- tables.file[[eachtable]]
+  
+  print(head(thistable))
+ 
+  print("Rows in thistable")
+  print(nrow(thistable))
+  
+  if(eachtable==1){
+    print("First table")
+    
+    this.header <-  names(thistable) %>% 
+      gsub("DiCB-","", .) %>% 
+      gsub("TrCB-","", .) %>% 
+      gsub("TeCB-","", .) %>% 
+      gsub("PeCB-","", .) %>% 
+      gsub("HxCB-","", .) %>% 
+      gsub("HpCB-","", .) %>%
+      gsub("OcCB-","", .) 
+    
+    names(thistable) <- this.header
+    
+    current.table <- thistable %>% 
+      dplyr::rename(station=`...1`)
+    
+    
+  } else if(eachtable>1){
+    
+    if(nrow(thistable)==nrow(current.table)){
+      
+      this.header <-  names(thistable) %>% 
+        gsub("DiCB-","", .) %>% 
+        gsub("TrCB-","", .) %>% 
+        gsub("TeCB-","", .) %>% 
+        gsub("PeCB-","", .) %>% 
+        gsub("HxCB-","", .) %>% 
+        gsub("HpCB-","", .) %>%
+        gsub("OcCB-","", .) 
+      
+      names(thistable) <- this.header
+      
+      print("number of rows is the same")
+      current.table <- thistable %>% 
+        dplyr::select(-`...1`) %>% 
+        # dplyr::full_join(current.table, ., by=c("station"))
+        dplyr::bind_cols(current.table, .)
+      
+    } else {
+      
+      print("number of rows is different")
+      
+      this.header <- thistable[1,] %>% 
+        as.character() %>% 
+        gsub("DiCB-","", .) %>% 
+        gsub("TrCB-","", .) %>% 
+        gsub("TeCB-","", .) %>% 
+        gsub("PeCB-","", .) %>% 
+        gsub("HxCB-","", .) %>% 
+        gsub("HpCB-","", .) %>%
+        gsub("OcCB-","", .) 
+      
+      names(thistable) <- this.header
+      
+       
+      current.table <- thistable[2:nrow(thistable),] %>% 
+        dplyr::bind_cols(current.table, .)
+      #dplyr::full_join(current.table, ., by=c("station"))
+      
+    }
+  } 
+  print("Cols in current table")
+  print(ncol(current.table))
+  
+}
+
+
+#second set of data
+no.tables <- 15:length(no.pdf.files)
+rm(eachtable)
+rm(current.table.2)
+
+for(eachtable in no.tables) {
+  
+  print("Analyzing table no")
+  print(eachtable)
+  
+  thistable <- tables.file[[eachtable]]
+  
+  print("Rows in this table")
+  print(nrow(thistable))
+  
+  if(eachtable==15) {
+    
+      this.header <-  names(thistable) %>% 
+        gsub("DiCB-","", .) %>% 
+        gsub("TrCB-","", .) %>% 
+        gsub("TeCB-","", .) %>% 
+        gsub("PeCB-","", .) %>% 
+        gsub("HxCB-","", .) %>% 
+        gsub("HpCB-","", .) %>%
+        gsub("OcCB-","", .) 
+      
+      names(thistable) <- this.header
+
+    current.table.2 <- thistable %>% 
+      dplyr::rename(station=`...1`)
+    
+  } else if(eachtable>=15){
+    
+      this.header <-  names(thistable) %>% 
+        gsub("DiCB-","", .) %>% 
+        gsub("TrCB-","", .) %>% 
+        gsub("TeCB-","", .) %>% 
+        gsub("PeCB-","", .) %>% 
+        gsub("HxCB-","", .) %>% 
+        gsub("HpCB-","", .) %>%
+        gsub("OcCB-","", .) 
+      
+      names(thistable) <- this.header
+
+    current.table.2 <- thistable %>% 
+      dplyr::select(-`...1`) %>% 
+      #dplyr::full_join(current.table, ., by=c("station"))
+      dplyr::bind_cols(current.table.2, .)
+  }
+  
+  print("Rows in current table")
+  print(nrow(current.table.2))
+}
+
+colnames(current.table)==colnames(current.table.2)
+
+ res.table.all <- dplyr::bind_rows(current.table, current.table.2) %>%
+dplyr::mutate(sample=1:dplyr::n()) %>%
+dplyr::select(-station) %>%
+dplyr::select(sample, everything()) %>%
+tidyr::pivot_longer(cols=2:ncol(.), names_to="pcb_congener", values_to = "value") %>%
+dplyr::mutate(value=stringi::stri_replace_all_regex(value,
+pattern=c('> ', '< '),
+replacement=c(''),
+vectorize=FALSE)) %>%
+dplyr::mutate(value=dplyr::if_else(grepl("NDR",value),"0",value)) %>% 
+tidyr::pivot_wider(names_from = pcb_congener, values_from = value)
+
+
+
+all.samples <- res.table.all %>% 
+    dplyr::mutate(unit = "pg/g DW", year = "2011", common_name = "sediment", functional_group = "sediment", citation=pdf.dirname, sample_no = 1:dplyr::n(), sample= "sediment",strata = "sampling locations", atlantis_polygon=1) 
+
+#write and read again to make data as double
+readr::write_csv(all.samples, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+all.samples <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+#calculate ratios
+
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+
+tables.selec <- all.samples %>% 
+  dplyr::mutate(tot_pcb = rowSums(dplyr::across(dplyr::where(is.numeric)), na.rm=TRUE)) %>% 
+  dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=(`153`+`168`)/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`138/163/164`+`129`+`158/160`)/tot_pcb, per_138=ratio_138*100) %>% 
+   dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() +
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Ross et al. 2011. Point Grey",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+
+```
+
+
+
+#Extract
+Location Sands Head
+Ross, P. S., K.A. Harris, N.J. Dangerfield, N.F. Crewe, C. Dubetz, M.B. Fischer, T.L. Fraser, and A.R.S. Ross 2011. Sediment concentrations of PCBs, PBDEs, PCDDs and PCDFs from disposal at sea sites at Point Grey and Sand Heads, British Columbia in 2010. Fisheries and Oceans Canada, Ottawa, Canada. Canadian Data Report of Fisheries and Aquatic Sciences 1239.
+
+```{r}
+
+pdf.filename <- "tables_Ross_2011_2.pdf"
+
+pdf.dirname <- "ross2011_2"
+
+split_pdf(pdf.filename, pdf.dirname)
+
+#Extract tables
+
+pdf.list <- list.files(here::here("inputs", pdf.dirname), pattern = "tables_Ross", full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+tables.file <- lapply(no.pdf.files, get_table, pdf.list, pdf.dirname) 
+
+no.tables <- 1:length(tables.file)
+
+
+#need to run this separately because there are actually two tables
+no.tables <- 1:14
+rm(eachtable)
+rm(current.table)
+
+for(eachtable in no.tables){
+  
+  print(eachtable)
+  
+  thistable <- tables.file[[eachtable]]
+  
+  print("Rows in thistable")
+  print(nrow(thistable))
+  
+  if(eachtable==1){
+    print("First table")
+    
+    this.header <-  names(thistable) %>% 
+      gsub("DiCB-","", .) %>% 
+      gsub("TrCB-","", .) %>% 
+      gsub("TeCB-","", .) %>% 
+      gsub("PeCB-","", .) %>% 
+      gsub("HxCB-","", .) %>% 
+      gsub("HpCB-","", .) %>%
+      gsub("NoCB-","", .) %>%
+      gsub("DeCB-","", .) %>%
+      gsub("OcCB-","", .) 
+    
+    names(thistable) <- this.header
+    
+    current.table <- thistable %>% 
+      dplyr::rename(station=`...1`)
+    
+    
+  } else if(eachtable>1){
+    
+    if(nrow(thistable)==nrow(current.table)){
+      
+      this.header <-  names(thistable) %>% 
+        gsub("DiCB-","", .) %>% 
+        gsub("TrCB-","", .) %>% 
+        gsub("TeCB-","", .) %>% 
+        gsub("PeCB-","", .) %>% 
+        gsub("HxCB-","", .) %>% 
+        gsub("HpCB-","", .) %>%
+        gsub("OcCB-","", .) 
+      
+      names(thistable) <- this.header
+      
+      print("number of rows is the same")
+      current.table <- thistable %>% 
+        dplyr::select(-`...1`) %>% 
+        # dplyr::full_join(current.table, ., by=c("station"))
+        dplyr::bind_cols(current.table, .)
+      
+    } else {
+      
+      print("number of rows is different")
+      
+      this.header <- thistable[1,] %>% 
+        as.character() %>% 
+        gsub("DiCB-","", .) %>% 
+        gsub("TrCB-","", .) %>% 
+        gsub("TeCB-","", .) %>% 
+        gsub("PeCB-","", .) %>% 
+        gsub("HxCB-","", .) %>% 
+        gsub("HpCB-","", .) %>%
+        gsub("OcCB-","", .) 
+      
+      names(thistable) <- this.header
+      
+       
+      current.table <- thistable[2:nrow(thistable),] %>% 
+        dplyr::bind_cols(current.table, .)
+      #dplyr::full_join(current.table, ., by=c("station"))
+      
+    }
+  } 
+  print("Cols in current table")
+  print(ncol(current.table))
+  
+}
+
+
+#second set of data
+no.tables <- 15:length(no.pdf.files)
+rm(eachtable)
+rm(current.table.2)
+
+for(eachtable in no.tables) {
+  
+  print("Analyzing table no")
+  print(eachtable)
+  
+  thistable <- tables.file[[eachtable]]
+  
+  print("Rows in this table")
+  print(nrow(thistable))
+  
+  if(eachtable==15) {
+    
+      this.header <-  names(thistable) %>% 
+        gsub("DiCB-","", .) %>% 
+        gsub("TrCB-","", .) %>% 
+        gsub("TeCB-","", .) %>% 
+        gsub("PeCB-","", .) %>% 
+        gsub("HxCB-","", .) %>% 
+        gsub("HpCB-","", .) %>%
+        gsub("OcCB-","", .) 
+      
+      names(thistable) <- this.header
+
+    current.table.2 <- thistable %>% 
+      dplyr::rename(station=`...1`)
+    
+  } else if(eachtable>=15){
+    
+      this.header <-  names(thistable) %>% 
+        gsub("DiCB-","", .) %>% 
+        gsub("TrCB-","", .) %>% 
+        gsub("TeCB-","", .) %>% 
+        gsub("PeCB-","", .) %>% 
+        gsub("HxCB-","", .) %>% 
+        gsub("HpCB-","", .) %>%
+        gsub("OcCB-","", .) 
+      
+      names(thistable) <- this.header
+
+    current.table.2 <- thistable %>% 
+      dplyr::select(-`...1`) %>% 
+      #dplyr::full_join(current.table, ., by=c("station"))
+      dplyr::bind_cols(current.table.2, .)
+  }
+  
+  print("Rows in current table")
+  print(nrow(current.table.2))
+}
+
+any(colnames(current.table)==colnames(current.table.2))==FALSE
+
+res.table.all <- dplyr::bind_rows(current.table, current.table.2) %>%
+dplyr::mutate(sample=1:dplyr::n()) %>%
+dplyr::select(-station) %>%
+dplyr::select(sample, everything()) %>%
+tidyr::pivot_longer(cols=2:ncol(.), names_to="pcb_congener", values_to = "value") %>%
+dplyr::mutate(value=stringi::stri_replace_all_regex(value,
+pattern=c('> ', '< '),
+replacement=c(''),
+vectorize=FALSE)) %>%
+dplyr::mutate(value=dplyr::if_else(grepl("NDR",value),"0",value)) %>% 
+dplyr::mutate(value=dplyr::if_else(grepl("N/A",value),"0",value)) %>% 
+tidyr::pivot_wider(names_from = pcb_congener, values_from = value)
+
+
+
+all.samples <- res.table.all %>% 
+    dplyr::mutate(unit = "pg/g DW", year = "2011", functional_group = "sediment", common_name = "sediment", sample = "sediment", citation=pdf.dirname, sample_no = 1:dplyr::n(), strata = "sampling locations", atlantis_polygon=1) 
+
+#write and read again to make data as double
+readr::write_csv(all.samples, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+all.samples <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+
+tables.selec <- all.samples %>% 
+  dplyr::mutate(tot_pcb = rowSums(dplyr::across(dplyr::where(is.numeric)), na.rm=TRUE)) %>% 
+  dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=(`153`+`168`)/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`138/163/164`+`129`+ `158/160`) / tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() +
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Ross et al. 2011. Sands Head",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+
+```
+
+#Extract
+Calambokidis, J., Jeffries, S., Ross, P. S., & Ikonomou, M. (1999). Temporal trends in contaminants in Puget sound harbor seals. Cascadia Research.
+
+```{r}
+#Table 5 coplanar PCBs
+#NDR means here that there was an error and the PCB was not detected, but the lab did report a value. These values are set to zero
+pdf.dirname <- "calambodikis1999_1"
+this.pdf <- "tables_Calambodikis_et_al_1999_1.pdf"
+
+tables.file.1 <- tabulapdf::extract_tables(here::here("inputs", pdf.dirname, this.pdf))
+
+res.table.1 <- tables.file.1[[1]] %>% 
+  dplyr::rename(station=`Field #`) %>% 
+  dplyr::select(-`Lab. sample #`, -`Lipd %`) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>%
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="pcb_congener", values_to = "value") %>%
+dplyr::mutate(value=dplyr::if_else(grepl("ND",value),"0",value)) %>% 
+dplyr::mutate(value=dplyr::if_else(grepl("NDR",value),"0",value)) %>% 
+dplyr::mutate(value=dplyr::if_else(grepl("N/A",value),"0",value)) %>% 
+  dplyr::mutate(pcb_congener= gsub("PCB","",pcb_congener))  
+
+readr::write_csv(res.table.1, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+res.table.1 <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+#table 5 coplanar PCBs
+all.res.table.1 <- res.table.1 %>% 
+tidyr::pivot_wider(names_from = pcb_congener, values_from = value)%>% 
+  dplyr::mutate(sum_pcb_cop=TOTDI+TOTTRI+TOTTETRA+TOTPENTA+TOTHEX) %>% 
+  dplyr::select(-dplyr::starts_with("TOT")) 
+
+
+#Table 6 mono-ortho PCBs
+
+pdf.filename <- "tables_Calambodikis_et_al_1999_2.pdf"
+
+pdf.dirname <- "calambodikis1999_2"
+
+split_pdf(pdf.filename, pdf.dirname)
+
+#Extract tables
+
+pdf.list <- list.files(here::here("inputs", pdf.dirname), pattern = "*.pdf", full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+tables.file <- lapply(no.pdf.files, get_table, pdf.list, pdf.dirname) 
+
+no.tables <- 1:length(tables.file)
+
+rm(eachtable)
+rm(current.table)
+
+for(eachtable in no.tables){
+  
+  print(eachtable)
+  
+  thistable <- tables.file[[eachtable]]
+  
+  print("Rows in thistable")
+  print(nrow(thistable))
+  
+  if(eachtable==1){
+    print("First table")
+    
+    this.header <-  names(thistable) %>% 
+      gsub("PCB","", .)  
+    
+    names(thistable) <- this.header
+    
+    current.table <- thistable 
+    
+    
+  } else if(eachtable>1){
+    
+    if(nrow(thistable)==nrow(current.table)){
+      
+      this.header <-  names(thistable) %>% 
+        gsub("PCB","", .)  
+      
+      names(thistable) <- this.header
+      
+      print("number of rows is the same")
+      current.table <- thistable %>% 
+        dplyr::select(-`Field #`) %>% 
+      # dplyr::full_join(current.table, ., by=c("station"))
+        dplyr::bind_cols(current.table, .)
+      
+    } else {
+      
+      print("number of rows is different")
+      }
+      
+
+    }
+  
+  print("Cols in current table")
+  print(ncol(current.table))
+  
+}
+
+
+res.table.2 <- current.table %>% 
+  dplyr::rename(station=`Field #`) %>% 
+  dplyr::select(-`Lab. sample #`) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>%
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="pcb_congener", values_to = "value") %>%
+dplyr::mutate(value=dplyr::if_else(grepl("ND",value),"0",value)) %>% 
+dplyr::mutate(value=dplyr::if_else(grepl("NDR\\(",value),"0",value)) %>% 
+dplyr::mutate(value=dplyr::if_else(grepl("N/A",value),"0",value)) %>%
+  dplyr::mutate(value=gsub("\\)","",value)) %>%
+  dplyr::mutate(pcb_congener= gsub("PCB","",pcb_congener))  
+
+readr::write_csv(res.table.2, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+res.table.2 <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+all.res.table.2 <- res.table.2 %>% 
+tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>% 
+  dplyr::mutate(sum_pcb_mon=TOTDICB+TOTTRICB+TOTTECB+TOTPECB+TOTHX+TOTHP) %>% 
+  dplyr::select(-dplyr::starts_with("TOT"), -station) 
+
+
+#Table 7 di-ortho PCBs
+
+pdf.filename <- "tables_Calambodikis_et_al_1999_3.pdf"
+
+pdf.dirname <- "calambodikis1999_3"
+
+split_pdf(pdf.filename, pdf.dirname)
+
+#Extract tables
+
+pdf.list <- list.files(here::here("inputs", pdf.dirname), pattern = "*.pdf", full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+tables.file <- lapply(no.pdf.files, get_table, pdf.list, pdf.dirname) 
+
+no.tables <- 1:length(tables.file)
+
+#CONTINUE HERE
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+
+current.table.1 <- tables.file[[1]] %>% 
+  dplyr::rename(station=`Field #`) %>% 
+  dplyr::select(-`Lab. sample #`, -dplyr::contains("...")) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>%
+  tidyr::separate_wider_delim(`PCB30 PCB18`, delim=" ", 
+                              names=c("PCB30","PCB18"), too_few = "align_start") %>%
+  tidyr::separate_wider_delim(`PCB17 PCB2724`, delim=" ", 
+                              names=c("PCB17","PCB2724"), too_few = "align_start") 
+
+current.table.2 <- tables.file[[2]] %>% 
+  dplyr::select(-dplyr::contains("..."), -`Field #`) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>%
+  tidyr::separate_wider_delim('PCB714164 PCB40', delim=" ", 
+                              names=c("PCB714164","PCB40"), too_few = "align_start") %>%
+  tidyr::separate_wider_delim('PCB96 PCB103', delim=" ", 
+                              names=c("PCB96", "PCB103"), too_few = "align_start") 
+
+current.table.3 <- tables.file[[3]] %>% 
+  dplyr::select(-dplyr::contains("..."), -`Field #`) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>%
+  tidyr::separate_wider_delim('PCB110 PCB82', delim=" ", 
+                              names=c("PCB110", "PCB82"), too_few = "align_start") 
+
+current.table.4 <- tables.file[[4]] %>% 
+  dplyr::select(-dplyr::contains("..."), -`Field #`) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>%
+  tidyr::separate_wider_delim('PCB145 PCB148', delim=" ", 
+                              names=c("PCB145", "PCB148"), too_few = "align_start") %>%
+  tidyr::separate_wider_delim('PCB133 PCB165', delim=" ", 
+                              names=c("PCB133", "PCB165"), too_few = "align_start")
+
+current.table.5 <- tables.file[[5]] %>% 
+   dplyr::select(-dplyr::contains("..."), -`Field #`) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>%
+  tidyr::separate_wider_delim('TOTHX PCB188', delim=" ", 
+                              names=c("TOTHX", "PCB188"), too_few = "align_start") 
+
+current.table.6 <- tables.file[[6]] %>% 
+  dplyr::select(-dplyr::contains("..."), -`Field #`) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>%
+  tidyr::separate_wider_delim('PCB200 PCB204', delim=" ", 
+                              names=c("PCB200", "PCB204"), too_few = "align_start") 
+
+current.table.7 <- tables.file[[7]] %>% 
+  dplyr::select(-dplyr::contains("..."), -`Field #`) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>%
+  tidyr::separate_wider_delim('PCB194 PCB205', delim=" ", 
+                              names=c("PCB194", "PCB205"), too_few = "align_start")
+
+res.table.3 <- dplyr::bind_cols(current.table.1,current.table.2, current.table.3, current.table.4, current.table.5, current.table.6, current.table.7) %>% 
+  dplyr::mutate_if(is.numeric, as.character) %>%
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="pcb_congener", values_to = "value") %>%
+dplyr::mutate(value=dplyr::if_else(grepl("ND",value),"0",value)) %>% 
+dplyr::mutate(value=dplyr::if_else(grepl("NDR\\(",value),"0",value)) %>% 
+dplyr::mutate(value=dplyr::if_else(grepl("N/A",value),"0",value)) %>%
+  dplyr::mutate(value=gsub("\\)","",value)) %>%
+  dplyr::mutate(pcb_congener= gsub("PCB","",pcb_congener))  
+
+readr::write_csv(res.table.3, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+res.table.3 <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+res.table.3.tot <- res.table.3 %>% 
+tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>% 
+  dplyr::select(dplyr::contains("TOT")) %>% 
+dplyr::mutate(sum_pcb_dio = rowSums(dplyr::across(dplyr::where(is.numeric)), na.rm=TRUE)) %>% 
+  dplyr::select(sum_pcb_dio)
+
+
+all.res.table.3 <- res.table.3 %>% 
+tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>% 
+  dplyr::select(-dplyr::contains("TOT"), -station) %>% 
+  dplyr::bind_cols(res.table.3.tot, .) 
+
+res.table.all <- dplyr::bind_cols(all.res.table.1, all.res.table.2, all.res.table.3) %>% 
+  dplyr::mutate(sample=1:dplyr::n()) %>%
+  dplyr::select(sample, everything()) %>% 
+  dplyr::mutate(atlantis_polygon=dplyr::if_else(station=="CRC 381",59, #Steamboat island
+                                                dplyr::if_else(station=="CRC 111",57, #Henderson
+                                                               dplyr::if_else(station=="CRC 125",57, # Henderson
+                                                               dplyr::if_else(station=="CRC 126",58,55))))) %>% # CRC 126 Budd Inlet, Most other samples were Gertrude Island polygon 55
+  dplyr::select(-station)
+
+pdf.dirname <- "calambodikis1999"
+
+all.samples <- res.table.all %>% 
+  dplyr::mutate(tot_pcb=sum_pcb_cop + sum_pcb_mon + sum_pcb_dio) %>%
+  dplyr::select(-sum_pcb_cop, -sum_pcb_mon, -sum_pcb_dio) %>%
+    dplyr::mutate(unit = "ng/kg wet weight", year = "1984-1996", functional_group = "HSL", common_name = "Harbor seal", sample = "blubber", citation=pdf.dirname, sample_no = 1:dplyr::n(), strata = "sampling locations & dates") 
+
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+#units ng/kg wet weight
+
+tables.selec <- all.samples %>% 
+  dplyr::mutate(ratio_118=`118106`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=(`132153`+`168`)/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`129`+`160163164138`)/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() +
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Calambodikis 1999",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+```
+
+
+
+#Extract
+WADOE. 2015. Port Gardner Bay Regional Background Sediment Characterization. Washington Department of Ecology. Publication no. 13-09-049.
+
+C/C180 – the C indicates the congener co-elutes as a congener pair, if the C is followed by a number the results are reported with 
+the congener pair 
+U- the analyte was analyzed for but not detected 
+J – the analyte was positively identified, the associated numerical value is the approximate concentration of the analyte in the 
+sample 
+B- analyte found in the sample and the associated blank 
+K – identifies a target that could not be confirmed by virtue of not satisfying all method required criteria, the reported value may 
+be interpreted as an estimated maximum analyte concentration 
+TEQ – toxicity equivalency 
+
+```{r}
+
+pdf.filename <- "tables_WDOE_2015_B.pdf"
+
+pdf.dirname <- "wdoe2015_2"
+
+split_pdf(pdf.filename, pdf.dirname)
+
+#Extract tables
+
+pdf.list <- list.files(here::here("inputs", pdf.dirname), pattern = "*.*pdf", full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+tables.file <- lapply(no.pdf.files, get_table, pdf.list, pdf.dirname) 
+
+current.table.1 <- tables.file[[1]] %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("U",`...4`),"0", `PGP01`)) %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("U",`...4`),"0", `PGP01`)) %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("C",PGP01),"0", `PGP01`)) %>%
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("U",`...6`),"0", `PGP09`)) %>% 
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("U",`...6`),"0", `PGP09`)) %>% 
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("C",`PGP09`),"0", `PGP09`)) %>%
+  dplyr::select(-LocationID, -"...4", -"...6", -"...7") %>%
+  dplyr::rename(pcb_congener = `...2`) %>% 
+  dplyr::mutate(pcb_congener= gsub("PCB-","",pcb_congener)) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="sampling_location", values_to = "value") %>%
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) 
+
+current.table.1
+
+current.table.2 <- tables.file[[2]] %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("U",`...4`),"0", `PGP01`)) %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("U",`...4`),"0", `PGP01`)) %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("C",`PGP01`),"0", `PGP01`)) %>%
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("U",`...6`),"0", `PGP09`)) %>% 
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("U",`...6`),"0", `PGP09`)) %>% 
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("C",`PGP09`),"0", `PGP09`)) %>%
+  dplyr::select(-LocationID, -"...4", -"...6") %>%
+  dplyr::rename(pcb_congener = `...2`) %>% 
+  dplyr::mutate(pcb_congener= gsub("PCB-","",pcb_congener)) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="sampling_location", values_to = "value") %>%
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>% 
+  dplyr::select(-sampling_location) 
+
+current.table.2
+
+
+current.table.3 <- tables.file[[3]] %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("U",`...4`),"0", `PGP01`)) %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("U",`...4`),"0", `PGP01`)) %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("C",`PGP01`),"0", `PGP01`)) %>%
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("U",`...6`),"0", `PGP09`)) %>% 
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("U",`...6`),"0", `PGP09`)) %>% 
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("C",`PGP09`),"0", `PGP09`)) %>%
+  dplyr::select(-LocationID, -"...4", -"...6") %>%
+  dplyr::rename(pcb_congener = `...2`) %>% 
+  dplyr::mutate(pcb_congener= gsub("PCB-","",pcb_congener)) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="sampling_location", values_to = "value") %>%
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>% 
+  dplyr::select(-sampling_location) 
+
+current.table.3
+
+current.table.4 <- tables.file[[4]] %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("U",`...4`),"0", `PGP01`)) %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("U",`...4`),"0", `PGP01`)) %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("C",`PGP01`),"0", `PGP01`)) %>%
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("U",`...6`),"0", `PGP09`)) %>% 
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("U",`...6`),"0", `PGP09`)) %>% 
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("C",`PGP09`),"0", `PGP09`)) %>%
+  dplyr::select(-LocationID, -"...4", -"...6", -"...7") %>%
+  dplyr::rename(pcb_congener = `...2`) %>% 
+  dplyr::mutate(pcb_congener= gsub("PCB-","",pcb_congener)) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="sampling_location", values_to = "value") %>%
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>% 
+  dplyr::select(-sampling_location) 
+
+current.table.4
+
+#Continue here
+current.table.5 <- tables.file[[5]] %>% 
+  dplyr::rename(pcb_congener = `...2`) %>% 
+  dplyr::filter(!LocationID=="PCB Total TEQ (1/2 DL)") %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("U",`...4`),"0", `PGP01`)) %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("U",`...4`),"0", `PGP01`)) %>% 
+  dplyr::mutate(PGP01=dplyr::if_else(grepl("C",`PGP01`),"0", `PGP01`)) %>%
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("U",`...7`),"0", `PGP09`)) %>% 
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("U",`...7`),"0", `PGP09`)) %>% 
+  dplyr::mutate(PGP09=dplyr::if_else(grepl("C",`PGP09`),"0", `PGP09`)) %>%
+  dplyr::mutate(pcb_congener=dplyr::if_else(grepl("Total PCBs",`LocationID`),"tot_pcb", pcb_congener)) %>%
+  dplyr::select(-LocationID, -"...4", -"...5", -"...7") %>%
+  dplyr::mutate(pcb_congener= gsub("PCB-","",pcb_congener)) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="sampling_location", values_to = "value") %>%
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>% 
+  dplyr::select(-sampling_location) 
+
+current.table.5
+
+
+res.table <- dplyr::bind_cols(current.table.1,current.table.2,current.table.3,current.table.4,current.table.5) 
+
+readr::write_csv(res.table, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+res.table <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+all.samples <- res.table %>% 
+dplyr::mutate(unit = "ng/kg dry weight", year = "2010", functional_group = "sediment", common_name = "sediment", sample = "sediment", citation=pdf.dirname, sample_no = 1:dplyr::n(), strata = "sampling locations & dates", atlantis_polygon=27) 
+
+
+#units ng/kg wet weight
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+
+tables.selec <- all.samples %>% 
+  dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=(`153`+`168`)/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`129`+`138`+`160`+`163`+`164`)/tot_pcb, per_138=ratio_138*100) %>% #combined with 129
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() +
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "WDOE 2015. Port Gardner",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+```
+
+#Extract 
+Grant, P. B., Johannessen, S. C., Macdonald, R. W., Yunker, M. B., Sanborn, M., Dangerfield, N., ... & Ross, P. S. (2011). Environmental fractionation of PCBs and PBDEs during particle transport as recorded by sediments in coastal waters. Environmental Toxicology and Chemistry, 30(7), 1522-1532.
+
+```{r}
+
+pdf.filename <- "tables_Grant_2011.pdf"
+
+pdf.dirname <- "grant2011"
+
+split_pdf(pdf.filename, pdf.dirname)
+
+#Extract tables
+
+pdf.list <- list.files(here::here("inputs", pdf.dirname), pattern = "*.*pdf", full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+tables.file <- lapply(no.pdf.files, get_table, pdf.list, pdf.dirname) 
+
+names.header <- tables.file[[1]][1,] %>% 
+  gsub("PCB-","", .)
+
+selec.locs <- c("27","19","20","37","33","31","25","21","26","29","8","36","38","20","17","1") # sampling locations south of the Fraser River
+pol.4 <- c("38","30","17") #pol 4
+pol.18 <- "1"
+#other are polygons 1
+
+res.table <- tables.file[[1]][2:nrow(tables.file[[1]]),] %>%
+  magrittr::set_colnames(names.header) %>%
+  dplyr::select(-dplyr::contains("log"), -dplyr::contains("BDE")) %>%
+  dplyr::filter(Site %in% selec.locs) %>%
+  dplyr::mutate(atlantis_polygon = dplyr::if_else(Site %in% pol.4, "4",
+                                                dplyr::if_else(Site %in% pol.18, "18", "1"))) %>%
+  dplyr::mutate(sample_no = 1:dplyr::n()) %>% 
+  dplyr::select(sample_no, atlantis_polygon, PCB, dplyr::everything(),-Site, -Location, -`(m)`) %>% 
+  dplyr::rename(tot_pcb=PCB) %>% 
+  tidyr::pivot_longer(cols=3:ncol(.), names_to="pcb_congener", values_to = "value") %>%
+  dplyr::mutate(value=(gsub(",","", value))) %>%
+  dplyr::mutate(value=as.numeric(value)) %>% 
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = value) 
+  
+
+readr::write_csv(res.table, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+res.table <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+all.samples <- res.table %>% 
+dplyr::mutate(unit = "ng/kg dry weight", year = "2010", functional_group = "sediment", common_name = "sediment", sample = "sediment", citation=pdf.dirname, strata = "sampling locations & dates") 
+
+
+#units ng/kg wet weight
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+#Could not add other congeners because they were not reported
+
+tables.selec <- all.samples %>% 
+  dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=`153`/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=`138`/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() +
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Grant et al. 2011",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+```
+
+#Extract
+Ross, P. S., Noël, M., Lambourn, D., Dangerfield, N., Calambokidis, J., & Jeffries, S. (2013). Declining concentrations of persistent PCBs, PBDEs, PCDEs, and PCNs in harbor seals (Phoca vitulina) from the Salish Sea. Progress in Oceanography, 115, 160-170.
+
+```{r}
+googlesheets4::gs4_deauth()
+
+sheet.link <- "https://docs.google.com/spreadsheets/d/1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU/edit?gid=1189771879#gid=1189771879"
+
+sheet.name <- "ross_2013"
+pdf.dirname <- "ross2013"
+
+res.table <- googlesheets4::read_sheet(sheet.link, sheet = sheet.name, col_types = c("ccddddi")) %>% 
+  dplyr::filter(!is.na(atlantis_polygon)) %>% #Not using Hornby Island samples because it is too far north in the Strait of Georgia
+  dplyr::mutate(pcb_congener=as.character(pcb_congener)) %>%
+   dplyr::select(site, atlantis_polygon, pcb_congener, pcb_concentration) %>% 
+  tidyr::pivot_wider(names_from = pcb_congener, values_from = pcb_concentration) %>% 
+  tidyr::pivot_longer(cols=3:ncol(.), names_to="pcb_congener", values_to = "value") %>% 
+  dplyr::mutate(value = tidyr::replace_na(value, 0)) %>%
+ tidyr::pivot_wider(names_from = pcb_congener, values_from = value) 
+
+  
+readr::write_csv(res.table, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+res.table <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+
+all.samples <- res.table %>% 
+dplyr::mutate(unit = "ug/kg lipid weight", year = "2003", functional_group = "HSL", common_name = "harbor seals", sample_no = 1:dplyr::n(), sample = "blubber", citation=pdf.dirname, strata = "sampling locations") 
+
+
+#units ng/kg wet weight
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+#could not add other congeners because they were not reported
+
+tables.selec <- all.samples %>% 
+  dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=`153`/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=`138`/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_point() + #use geom_point because there is only one value per location
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Ross al. 2013",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+```
+
+
+Did not use data from:
+
+Brewer, R., Sekela, M., Sylvestre, S., Tuominen, T., & Moyle, G. (1998). Contaminants in bed sediments from 15 reaches of the Fraser River basin. Fraser River Action Plan.
+
+The table extractor would not work, I tried to take values directly from the tables but the total pcb values didn't make sense
+
+
+#Extract
+
+Alava Santos, J. J. (2011). Bioaccumulation of pollutants in Galapagos sea lions and marine mammals from British Columbia, Canada.
+```{r}
+googlesheets4::gs4_deauth()
+
+sheet.link <- "https://docs.google.com/spreadsheets/d/1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU/edit?gid=1189771879#gid=1189771879"
+
+sheet.name <- "alava_2011"
+
+pdf.dirname <- "alava2011"
+
+
+res.table <- googlesheets4::read_sheet(sheet.link, sheet = sheet.name, col_types = c("cddcdcdcdc")) %>% 
+  dplyr::select(-dplyr::contains("range")) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="stage", values_to = "value") %>% 
+  dplyr::mutate(value = tidyr::replace_na(value, 0)) %>%
+  dplyr::mutate(pcb_congener = gsub("PCB-","", pcb_congener)) %>%
+ tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>% 
+  dplyr::select(-`Lipid %`)
+
+
+readr::write_csv(res.table, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+res.table <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+year.tib <- tidyr::tibble(year=c("2006","2005-2006","2005-2006","2005-2006","2006"))
+
+all.samples <- res.table %>% 
+dplyr::mutate(unit = "ug/kg lipid weight", functional_group = "PIN", common_name = "steller sea lions", sample_no = 1:dplyr::n(), sample = "blubber", citation=pdf.dirname, strata = "sampling locations", atlantis_polygon = 1) %>% 
+  dplyr::bind_cols(year.tib)
+
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+
+#units ng/kg wet weight
+
+tables.selec <- all.samples %>% 
+  dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=`153/168`/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=`129/138/160/163`/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() + 
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Alava-Santos 2011",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+```
+
+#Extract
+
+King County. 2020. West Point Flooding Event Zooplankton Tissue Report. Prepared by 
+Jennifer Lanksbury and Debra Williston, Water and Land Resources Division. 
+Seattle, Washington.  
+```{r}
+
+sample.list <- c("L46495-3","L46495-6","L46495-6","L48718-3","L48718-6","L67646-2","L67646-4","L68350-1","L68350-2","L68350-2","L-70132-1","L-70132-2","L-70840-1")
+
+this.pol <- "43"
+
+file.no <- 1:5
+
+pdf.name <- "tables_King_County_2020"
+
+pdf.dir <- "king2020"
+pdf.dirname <- "king2020"
+
+current.table.a <- lapply(file.no, get_table_king, pdf.name, pdf.dir, sample.list)
+  
+#Results with a concentration greater than five 
+#times the detected value in the method blank were “B1” flagged (see Appendix B). When 
+#sample concentrations are within five times the method blank concentration, results are 
+#often treated as non-detected values by data validators. 
+#U target analyst was not detected
+
+#Tables 1-5 are formatted differently than 6-13, the co-eluting congeners are different so need to calculate proportions separately
+
+current.table.1 <- dplyr::bind_rows(current.table.a[[1]], current.table.a[[2]], current.table.a[[3]], current.table.a[[4]], current.table.a[[5]]) %>% 
+ dplyr::bind_rows() %>% 
+  dplyr::mutate(dplyr::across(tidyr::everything(), ~tidyr::replace_na(.x, 0))) %>% 
+  dplyr::mutate(sample_no = 1:nrow(.)) 
+
+#once I selected the worng area
+#current.table[[6]] <- current.table[[6]][,1:184]
+#current.table[[6]] <- current.table.test[[1]]
+
+file.no <- 6:length(sample.list)
+
+pdf.name <- "tables_King_County_2020"
+
+current.table.b <- lapply(file.no, get_table_king, pdf.name, pdf.dir, sample.list)
+
+current.table.2 <- dplyr::bind_rows(current.table.b[[1]], current.table.b[[2]], current.table.b[[3]], current.table.b[[4]], current.table.b[[5]], current.table.b[[6]], current.table.b[[7]], current.table.b[[8]]) %>% 
+  dplyr::bind_rows() %>% 
+  dplyr::mutate(dplyr::across(tidyr::everything(), ~tidyr::replace_na(.x, 0))) %>% 
+  dplyr::mutate(sample_no = (1:nrow(.)+5)) 
+
+
+readr::write_csv(current.table.1, here::here("outputs",paste0(pdf.dirname,"_1.csv")))
+readr::write_csv(current.table.2, here::here("outputs",paste0(pdf.dirname,"_2.csv")))
+
+
+current.table.1 <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,"_1.csv"))) 
+current.table.2 <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,"_2.csv"))) 
+
+#Jefferson Head, North Central Basin KSBP01 47.7440° -122.4282° 
+#Fauntleroy, Mid-Central Basin (Mid-CB) LSNT01 1245194 198653 47.5333° -122.4333° 
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+
+all.samples.1 <- current.table.1 %>% 
+  dplyr::mutate(tot_pcb = rowSums(dplyr::across(dplyr::where(is.numeric)), na.rm=TRUE)) %>%
+  dplyr::select(sample_no, tot_pcb, "118","153 + 168","129 + 138 + 160 + 163","164", tot_pcb) %>% 
+  dplyr::mutate("153"=`153 + 168`, "138"=(`129 + 138 + 160 + 163`+`164`)) %>% 
+  dplyr::select(sample_no, tot_pcb, `118`,`153`,`138`) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="pcb_congener", values_to = "value")
+
+all.samples.2 <- current.table.2 %>% 
+  dplyr::mutate(tot_pcb = rowSums(dplyr::across(dplyr::where(is.numeric)), na.rm=TRUE)) %>%
+  dplyr::select(sample_no, tot_pcb, "118","153","168","129","138","160","163/164", tot_pcb) %>% 
+  dplyr::mutate("153"=`153` + `168`, "138"=(`129` + `138` + `160` + `163/164`)) %>%    
+  dplyr::select(sample_no, tot_pcb, `118`,`153`,`138`) %>% 
+  tidyr::pivot_longer(cols=2:ncol(.), names_to="pcb_congener", values_to = "value")
+
+
+all.samples <- dplyr::bind_rows(all.samples.1, all.samples.2) %>% 
+   tidyr::pivot_wider(names_from = pcb_congener, values_from = value) %>% 
+dplyr::mutate(atlantis_polygon = this.pol, unit = "ug/kg wet weight", year = "2017-2018", functional_group = "ZM/ZL", common_name = "zooplankton", sample = "zooplankton tissue", citation=pdf.dirname, strata = "sampling locations & dates") %>% 
+   dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=`153`/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=`138`/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- all.samples %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() +
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "King County 2020",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(all.samples, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+```
+
+
+#Extract
+
+Guy, J. M. G. (2018). A risk analysis of legacy pollutants: PCBs, PBDEs and new emerging pollutants in Salish sea killer whales.
+This data was also used by Pearce, R. 2018. Bioaccumulation of PCBs in Southern Resident Killer Whales in the Salish Sea.
+```{r}
+
+pdf.dir <- "guy_2018"
+pdf.dirname <- "guy_2018"
+
+googlesheets4::gs4_deauth()
+
+sheet.link <- "https://docs.google.com/spreadsheets/d/1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU/edit?gid=1189771879#gid=1189771879"
+
+sheet.name <- "Guy_2018_chinook"
+
+current.table <- googlesheets4::read_sheet(sheet.link, sheet = sheet.name, col_types = c("cciccccccddccc")) %>% 
+ dplyr::mutate(Coelutions = dplyr::if_else(is.na(Coelutions),`IUPAC Number`, Coelutions)) %>% 
+  dplyr::select(`Sample ID`, Coelutions, Concentrations, `IUPAC Number`, `Animal ID`) %>% 
+  dplyr::rename(pcb_congener = Coelutions, value = Concentrations) 
+
+#continue here
+res.table.blank <- current.table %>% 
+  dplyr::filter(`Sample ID`=="Lab Blank") %>% 
+  dplyr::select(pcb_congener, value, `IUPAC Number`) %>% 
+  dplyr::rename(blank=value)
+
+res.table.1 <- current.table %>%
+  dplyr::filter(`Sample ID`!="Lab Blank") %>%
+  dplyr::group_by(`Sample ID`, `Animal ID`) %>% 
+  dplyr::mutate(sample_no = dplyr::cur_group_id()) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(res.table.blank, by = c("pcb_congener","IUPAC Number")) %>% 
+  dplyr::mutate(corr_value = value-blank) %>% 
+  dplyr::mutate(new_value=dplyr::if_else(corr_value<0, 0, corr_value)) %>%
+  dplyr::select(sample_no, `IUPAC Number`,new_value) %>%
+  dplyr::rename(value=new_value) %>%
+  tidyr::pivot_wider(names_from = `IUPAC Number`, values_from = value) %>% 
+  dplyr::mutate(functional_group = "Chinook", common_name = "Chinook salmon", year=2014, sample = "tissue", citation=pdf.dirname, strata = "fish samples", atlantis_polygon = 18, unit = "pg/g (wet weight)")
+
+readr::write_csv(res.table.1, here::here("outputs",paste0(sheet.name,".csv")))
+
+res.table.1 <-readr::read_csv(here::here("outputs",paste0(sheet.name,".csv"))) 
+
+
+sheet.name <- "Guy_2018_SRKW"
+
+current.table <- googlesheets4::read_sheet(sheet.link, sheet = sheet.name, col_types = c("cciccccccddccc")) %>% 
+  dplyr::mutate(Coelutions = dplyr::if_else(is.na(Coelutions),`IUPAC Number`, Coelutions)) %>% 
+  dplyr::select(`Animal ID`, `Batch Number`, Coelutions, Concentrations, `IUPAC Number`) %>% 
+  dplyr::rename(pcb_congener = Coelutions, value = Concentrations, sample_type = `Animal ID`, batch = `Batch Number`) 
+
+res.table.blank <- current.table %>% 
+  dplyr::filter(sample_type=="Lab Blank") %>% 
+  dplyr::select(`IUPAC Number`, batch, pcb_congener, value) %>% 
+  dplyr::rename(blank=value)
+
+#eliminated blubber sample because they were missing PCB 118 and 138
+res.table.2 <- current.table %>%
+  dplyr::filter(sample_type!="Lab Blank") %>%
+  dplyr::filter(sample_type!="Blubber") %>% 
+  dplyr::group_by(`sample_type`, `batch`) %>% 
+  dplyr::mutate(sample_no = dplyr::cur_group_id()) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(res.table.blank, by = c("batch","pcb_congener","IUPAC Number")) %>% 
+  dplyr::mutate(corr_value = value-blank) %>% 
+  dplyr::mutate(new_value=dplyr::if_else(corr_value<0, 0, corr_value)) %>%
+  dplyr::select(-sample_type, -batch, -value, -pcb_congener,-blank, -corr_value) %>%
+  dplyr::rename(value=new_value) %>%
+  tidyr::pivot_wider(names_from = `IUPAC Number`, values_from = value) %>% 
+  dplyr::mutate(dplyr::across(dplyr::everything(), ~tidyr::replace_na(.x, 0)))
+
+#test.duplicates <- res.table.2 %>%
+#  dplyr::group_by(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit,tot_pcb) %>%  # Group by the columns you want to check for duplicates
+#  dplyr::filter(dplyr::n() > 1) %>%          # Keep only groups with more than one row (i.e., duplicates)
+#  dplyr::ungroup() 
+
+
+readr::write_csv(res.table.2, here::here("outputs",paste0(sheet.name,".csv")))
+
+res.table.2 <-readr::read_csv(here::here("outputs",paste0(sheet.name,".csv"))) 
+
+
+
+#check strata and atlantis polygon
+all.samples.1 <- res.table.1 %>% 
+dplyr::mutate(functional_group = "Chinook", common_name = "Chinook salmon", year=2014, sample = "tissue", citation=pdf.dirname, strata = "year", atlantis_polygon = 18, unit = "pg/g wet weight")
+
+all.samples.2 <- res.table.2 %>% 
+dplyr::mutate(functional_group = "ROR", common_name = "Souther Resident orcas", year=2015, sample = "tissue", citation=pdf.dirname, strata = "year", atlantis_polygon = 1, unit = "pg/g")
+
+#units ng/kg wet weight
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+#138 is equal to 
+# 129 + 138 + 160 + 163
+#153 is equal to 
+#153 + 168
+
+tables.selec.1 <- all.samples.1 %>% 
+  dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=(`153`)/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`138`+`164`)/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+tables.selec.2 <- all.samples.2 %>% 
+  dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=(`153`)/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`138`+`164`)/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+ratio.loc.plot.1 <- tables.selec.1 %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() + 
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Guy 2018",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot.1
+
+ratio.loc.plot.2 <- tables.selec.2 %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() + 
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Guy 2018",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot.2
+
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+tables.selec.all <- dplyr::bind_rows(tables.selec.1, tables.selec.2)
+
+readr::write_csv(tables.selec.all, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+
+```
+
+#Extract
+
+Sun, Y. 2020. Sources, fractionation and fate of polybrominated diphenyl ethers and polychlorinated biphenyls in the Strait of Georgia, Canada. University of British Columbia.
+
+```{r}
+
+sample.list.1 <- c("UNITS","S1","S3","S3b","S3b_2")
+this.pol <- "1"
+
+file.no <- 1:2
+
+pdf.name <- "tables_Sun_2020"
+
+pdf.dir <- "sun2020"
+pdf.dirname <- "sun2020"
+
+# Do not select far left column with Congener class
+current.table <- lapply(file.no, get_table_sun, pdf.name, pdf.dir, sample.list.1)
+
+
+res.table.1 <- current.table[[1]] %>% 
+  dplyr::mutate(dplyr::across(tidyr::everything(), ~tidyr::replace_na(.x, 0))) %>% 
+  dplyr::mutate(tot_pcb = rowSums(dplyr::across(dplyr::where(is.numeric)), na.rm=TRUE))%>% 
+  dplyr::mutate(sample_no = 1:nrow(.)) %>% 
+  dplyr::select(-station_no) %>% 
+  dplyr::rename(`61 + 70 + 74 + 76`=`76`, `86 + 87 + 97 + 108 + 119 + 125`=`108 + 119 + 125`, `93 + 95 + 98 + 100 + 102` = `100 + 102`, `129 + 138 + 160 + 163`= `160 + 163`, `135 + 151 + 154`= `154`) %>% 
+  dplyr::select(-`61 + 70 + 74 +`,  -`86 + 87 + 97 +`, -`93 + 95 + 98 +`, -`129 + 138 +`, -`135 + 151 +`) 
+
+res.table.2 <- current.table[[2]] %>% 
+  dplyr::mutate(dplyr::across(tidyr::everything(), ~tidyr::replace_na(.x, 0))) %>% 
+  dplyr::mutate(tot_pcb = rowSums(dplyr::across(dplyr::where(is.numeric)), na.rm=TRUE)) %>% 
+  dplyr::mutate(sample_no = 1:nrow(.)+4) %>% 
+  dplyr::select(-station_no) %>% 
+  dplyr::rename(`61 + 70 + 74 + 76`=`+ 76`, `86 + 87 + 97 + 108 + 119 + 125`=`+ 108 + 119 + 125`, `93 + 95 + 98 + 100 + 102` = `+ 100 + 102`, `129 + 138 + 160 + 163`= `160 + 163`, `135 + 151 + 154`= `154`) %>% 
+  dplyr::select(-`61 + 70 + 74`,  -`86 + 87 + 97`, -`93 + 95 + 98`, -`129 + 138 +`, -`135 + 151 +`) 
+
+
+res.table <- dplyr::bind_rows(res.table.1, res.table.2) %>% 
+    dplyr::mutate(dplyr::across(tidyr::everything(), ~tidyr::replace_na(.x, 0))) 
+
+
+readr::write_csv(res.table, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+res.table <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) 
+
+
+year.tib <- tidyr::tibble(year=c(2013,2014,2015,2016, 2013,2014,2015,2016), functional_group=c("dissolved in seawater","dissolved in seawater","dissolved in seawater","dissolved in seawater","particulate in seawater","particulate in seawater","particulate in seawater","particulate in seawater"))
+
+#check strata and atlantis polygon
+all.samples <- res.table %>% 
+  dplyr::bind_cols(year.tib) %>%
+dplyr::mutate(common_name = "detritus", year=2020, citation=pdf.dirname, strata = "year & station", atlantis_polygon = 1, unit = "pg/L", sample="seawater")
+
+
+#units ng/kg wet weight
+
+#calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+tables.selec <- all.samples %>% 
+   dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=`153 + 168`/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`129 + 138 + 160 + 163`+`164`)/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb)
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() + 
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "Sun 2020",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+```
+
+USFWS ECMDS4 https://ecos.fws.gov/ecdms4/ Wildlife and Environmental contaminants database
+```{r}
+
+#list all files
+
+pdf.dirname <- "ecmds4"
+uwfs.files <- list.files(here::here("inputs","ECMDS4"), pattern = "*.csv", full.names = TRUE)
+
+num.files <- 1:length(uwfs.files)
+#this.file <- uwfs.files[14]
+
+tables.file <- lapply(num.files, get_usfws_table, uwfs.files)
+
+current.table <- tables.file %>% 
+  dplyr::bind_rows() %>% 
+  dplyr::group_by(`Sample Number`, `Catalog Number`) %>% 
+  dplyr::mutate(sample_no = dplyr::cur_group_id()) %>% 
+  dplyr::ungroup() 
+
+current.table %>% 
+  dplyr::mutate(index = 1) %>%
+  dplyr::group_by(sample_no) %>% 
+  dplyr::summarise(tot_samp=sum(index))
+  
+#res.table %>% dplyr::distinct(`Common Name`,`Genus / Species`) %>% View()  
+#res.table %>% dplyr::filter(`Common Name`=="Silver Salmon") %>% View()
+#res.table %>% dplyr::filter(is.na(year)) %>% View() 
+
+#import functional groups and common names
+googlesheets4::gs4_deauth()
+species.link <- "1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU"
+sp.sheet <- googlesheets4::read_sheet(species.link, sheet="species_ufws")
+
+#res.table %>% dplyr::distinct(`Sample Matrix`) %>% View()  
+#res.table %>% dplyr::distinct(`Decimal Latitude`,`Decimal Longitude`,`Location`) %>% View()  
+
+res.table <- current.table %>% 
+  dplyr::left_join(sp.sheet, by = c("Common Name")) %>%
+  dplyr::mutate(common_name=dplyr::if_else(`Common Name`=="Pacific Sand Lance (Ammodytidae, Ammodytes, Ammodytes hexapterus)", "Pacific Sand Lance", `Common Name`)) %>%
+  dplyr::mutate(value=as.numeric(`Wet Weight (ppm)`), unit="ppm wet weight", 
+                sample = `Sample Matrix`, citation=pdf.dirname, strata = "sampling locations") %>% 
+  dplyr::mutate(`Decimal Latitude`=as.numeric(`Decimal Latitude`), 
+                `Decimal Longitude`=as.numeric(`Decimal Longitude`)) %>%
+  dplyr::mutate(`Decimal Latitude`=dplyr::if_else(Location=="Longfellow Creek-Seattle",47.522348, `Decimal Latitude`),
+                `Decimal Longitude`=dplyr::if_else(Location=="Longfellow Creek-Seattle",-122.394234, `Decimal Longitude`)) %>% 
+  dplyr::mutate(`Sample Age`=dplyr::if_else(`Sample Age`=="", "NA", `Sample Age`)) %>%
+  dplyr::mutate(`Sample Sex`=dplyr::if_else(`Sample Sex`=="", "NA", `Sample Sex`)) %>%
+  dplyr::select(-`Sample Matrix`, -`Genus / Species`)
+
+
+atlantis.pol <- sf::st_read(here::here("inputs","atlantis_polygon","bgm_Puget_Sound_89b_0p0001_NAD83.shp")) 
+
+res.table.geo <- sf::st_as_sf(res.table, coords = c("Decimal Longitude", "Decimal Latitude"), crs = 4326, remove = FALSE) %>% 
+  sf::st_transform(crs=sf::st_crs(atlantis.pol))
+  
+#buffer polygons
+atlantis.pol.buffer <- sf::st_buffer(atlantis.pol, dist = 500)
+
+points.joined <- sf::st_intersection(res.table.geo, atlantis.pol.buffer)
+
+#did not use this because lat, lon and location were not unique
+#check atlantis_polygon
+#googlesheets4::gs4_deauth()
+#species.link <- "1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU"
+#sp.sheet <- googlesheets4::read_sheet(species.link, sheet="ufws_locations")
+
+all.samples <- points.joined %>% 
+  sf::st_drop_geometry() %>%
+  dplyr::mutate(atlantis_polygon = BOX_ID) %>%
+  dplyr::select(-Region, MinSimpTol, -MaxSimpTol, -BOTZ, -BOUNDARY, -PERIMETER, -AREA, -BOX_ID) %>% 
+  dplyr::mutate(functional_group = dplyr::if_else(common_name=="sediment","sediment", functional_group)) %>% 
+  dplyr::distinct()
+
+all.samples.tot <- all.samples %>% 
+   dplyr::group_by(sample_no, atlantis_polygon) %>%
+  dplyr::summarise(tot_pcb = sum(value), .groups = "keep") 
+  
+
+all.samples %>% dplyr::distinct(functional_group, common_name)
+
+point.plot <- ggplot2::ggplot() +
+  ggplot2::geom_sf(data = atlantis.pol.buffer, color= "blue", alpha = 0.5) +
+  ggplot2::geom_sf(data = atlantis.pol, color = "red", alpha = 0.5) +
+  ggplot2::geom_sf(data = res.table.geo, size = 1.5, color="black") +
+  ggplot2::geom_sf(data = points.joined, ggplot2::aes(color = `common_name`), size = 1) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(title = "USFWS ECMDS4 Data Points",
+                x = "Longitude",
+                y = "Latitude") +
+  ggplot2::theme(legend.position = "bottom")
+
+point.plot
+
+readr::write_csv(all.samples, here::here("outputs",paste0(pdf.dirname,".csv")))
+
+all.samples <-readr::read_csv(here::here("outputs",paste0(pdf.dirname,".csv"))) %>% 
+  dplyr::arrange(sample_no)
+
+these.samples <- unique(all.samples$sample_no)
+
+wide.data <- list()
+
+for(eachsample in these.samples){
+  
+#  print(eachsample)
+
+  #calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+  
+  this.sample.data <- all.samples %>% 
+    dplyr::filter(sample_no==eachsample) %>% 
+    dplyr::distinct(Catalog.Number, citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, pcb_congener, value) 
+  
+  tot.pcbs <- this.sample.data %>% 
+    dplyr::group_by(Catalog.Number, citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit) %>% 
+    dplyr::summarise(value = sum(value)) %>% 
+    dplyr::mutate(pcb_congener="tot_pcb")
+  
+  this.sample.con.data <- this.sample.data %>%
+    dplyr::filter(grepl("118|153|138|168|129|160|163|164", pcb_congener)) %>% 
+    dplyr::mutate(pcb_congener = dplyr::if_else(grepl("118", pcb_congener) , "118", 
+                                    dplyr::if_else(grepl("153", pcb_congener), "153",
+                                       dplyr::if_else(grepl("138", pcb_congener), "138", 
+                                                      dplyr::if_else(grepl("168", pcb_congener), "168",pcb_congener))))) %>%
+    dplyr::bind_rows(tot.pcbs) %>% 
+    tidyr::pivot_wider(names_from = pcb_congener, values_from = value) 
+    
+  
+  
+  
+  print(colnames(this.sample.con.data))
+  
+  wide.data[[eachsample]] <- this.sample.con.data
+    
+}
+ 
+
+ #citation,sample_no,strata,atlantis_polygon,common_name,functional_group,sample,year,unit,ratio_118,ratio_153,ratio_138,per_118,per_153,per_138,tot_pcb
+
+  #calculate ratios
+#sum coeluting PCBs
+#ratio_118=`118`/tot_pcb 
+#ratio_153=`153/168` 
+#ratio_138=`129/138/160/163/164`/tot_pcb
+
+tables.selec <- wide.data %>% 
+  dplyr::bind_rows() %>% 
+  dplyr::mutate(dplyr::across(tidyr::everything(), ~tidyr::replace_na(.x, 0))) %>% 
+  dplyr::mutate(ratio_118=`118`/tot_pcb, per_118=ratio_118*100, 
+                ratio_153=(`153`+`168`)/tot_pcb, per_153=ratio_153*100, 
+                ratio_138=(`138`+`164`)/tot_pcb, per_138=ratio_138*100) %>% 
+  dplyr::select(Catalog.Number, citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit, dplyr::contains("ratio_"), dplyr::contains("per_"),tot_pcb) %>% 
+  dplyr::filter(!is.na(ratio_118))
+
+tables.selec %>% View()
+
+
+ratio.loc.plot <- tables.selec %>% 
+  dplyr::select(citation, atlantis_polygon, functional_group, contains("per")) %>% 
+  dplyr::mutate(atlantis_polygon=as.factor(atlantis_polygon)) %>%
+  tidyr::pivot_longer(cols=per_118:per_138, names_to = "ratios", values_to="value") %>% 
+   ggplot2::ggplot(ggplot2::aes(x= atlantis_polygon, y = value, colour = ratios))+
+  ggplot2::geom_boxplot() + 
+  ggplot2::facet_wrap(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "USFWS ECMDS4",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+#headers should be   
+#citation sample_no location  common_name  functional_group sample unit  ratio_118 ratio_153 ratio_138 per_118 per_153 per_138 tot_pcb
+ 
+readr::write_csv(tables.selec, here::here("outputs",paste0(pdf.dirname,"_pcb_ratios.csv")), append = FALSE)  
+
+```
+
+
+Combine all data sets
+
+```{r}
+
+file.remove(here::here("outputs","all_pcb_ratios.csv"))
+file.remove(here::here("outputs","mean_pcb_ratios.csv"))
+
+res.files <- list.files(here::here("outputs"), pattern = "*_pcb_ratios.csv", full.names = TRUE)
+
+all.pcb.ratios <- lapply(res.files, readr::read_csv)
+
+no.files <- length(all.pcb.ratios)
+
+
+year.corr <- list()
+
+
+for(eachfile in 1:no.files){
+  print(eachfile)
+  
+  year.corr[[eachfile]] <- all.pcb.ratios[[eachfile]] %>% 
+    dplyr::mutate(year = as.character(year))
+  
+}
+
+all.pcb.data <- dplyr::bind_rows(year.corr) %>% 
+  dplyr::mutate(common_name = tolower(common_name)) %>% 
+  dplyr::mutate(strata=dplyr::if_else(strata=="sampling locations","sampling location",
+                                      dplyr::if_else(strata=="sampling locations & dates", "sampling location & date",
+                                                     dplyr::if_else(strata=="sampling locations & date", "sampling location & date", strata)))) %>% 
+   dplyr::mutate(unit=dplyr::if_else(unit=="ng/kg DW","ng/kg dry weight",
+                                      dplyr::if_else(unit=="pg/g (wet weight)", "pg/g wet weight",
+                                                     dplyr::if_else(unit=="pg/g (wet weight)", "pg/g wet weight", unit)))) %>% 
+   dplyr::mutate(common_name=dplyr::if_else(common_name=="harbor seal","harbor seals",common_name)) %>% 
+  dplyr::mutate(functional_group=dplyr::if_else(functional_group=="sediment bed","sediment",
+                  dplyr::if_else(functional_group=="particulate in seawater","detritus particulate in seawater", 
+                  dplyr::if_else(functional_group=="dissolved in seawater","detritus dissolved in seawater", functional_group))))
+
+
+test.duplicates <- all.pcb.data %>%
+  dplyr::group_by(citation, sample_no, strata, atlantis_polygon, common_name, functional_group, sample, year, unit,tot_pcb) %>%  # Group by the columns you want to check for duplicates
+  dplyr::filter(dplyr::n() > 1) %>%          # Keep only groups with more than one row (i.e., duplicates)
+  dplyr::ungroup() 
+
+readr::write_csv(all.pcb.data, here::here("outputs","all_pcb_ratios.csv"), append = FALSE)
+
+mean.ratios <- all.pcb.data %>% 
+  dplyr::group_by(functional_group) %>% 
+  dplyr::summarise(mean_ratio_118 = mean(ratio_118, na.rm=TRUE), 
+                   mean_ratio_153 = mean(ratio_153, na.rm=TRUE), 
+                   mean_ratio_138 = mean(ratio_138, na.rm=TRUE)) %>% 
+  dplyr::ungroup()
+
+readr::write_csv(mean.ratios, here::here("outputs","mean_pcb_ratios.csv"), append = FALSE)
+
+mean.ratios %>% dplyr::filter(functional_group=="Chinook")
+
+
+```
+
+
+
+```{r}
+#test if area or table is better
+eachpdf <- 1
+ this.pdf <- pdf.list[eachpdf]
+
+tables.file.t <- tabulapdf::extract_tables(this.pdf)
+tables.file.t
+tables.file.a <- tabulapdf::extract_areas(this.pdf)
+tables.file.a
+
+```
+
+
+EXTRA coordinates
+
+```{r}
+#Extract coordinates 
+coord.pdf <- here::here("inputs","tables_coords_Ross_2011_1.pdf")
+
+savedir.pdf <- "~/readpcbpdfs/inputs/ross2011"
+dir.create(savedir.pdf)
+
+tabulapdf::split_pdf("~/readpcbpdfs/inputs/tables_coords_Ross_2011_1.pdf", outdir = savedir.pdf)
+
+pdf.dirname <- "ross2011" 
+this.pattern <- "coords_Ross"
+pdf.list <- list.files(here::here("inputs", pdf.dirname), pattern = this.pattern, full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+coor.tables <- list()
+
+for(eachpdf in no.pdf.files){
+  
+  this.pdf <- pdf.list[eachpdf]
+  this.coor.table <- tabulapdf::extract_areas(this.pdf)
+  coor.tables[eachpdf] <- this.coor.table
+  
+}
+
+
+table.names <- c("sample", "date","lat","lon","depth","method")
+
+coord.locs.1 <- coor.tables[[1]][3:nrow(coor.tables[[1]]),]
+
+names(coord.locs.1) <- table.names
+
+coord.locs.2 <- coor.tables[[2]][3:nrow(coor.tables[[1]]),]
+
+names(coord.locs.2) <- table.names
+
+pg.coords <- dplyr::bind_rows(coord.locs.1, coord.locs.2)
+
+
+```
+

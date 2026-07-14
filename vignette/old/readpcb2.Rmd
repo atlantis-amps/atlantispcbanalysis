@@ -1,0 +1,122 @@
+---
+title: "Read PCB data"
+author: "H Morzaria-Luna"
+date: "2025-05-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+remotes::install_github(c("ropensci/tabulapdf"))
+usethis::use_package("daiR")
+usethis::use_package("tesseract")
+usethis::use_package("googlesheets4")
+usethis::use_package("dplyr")
+library(magrittr)
+```
+
+## Import PDF data from West et al. 2001
+West, J., S. O’Neill, G. Lippert, and S. Quinnell. 2001. Toxic contaminants in marine and anadromous fishes from Puget Sound, Washington. Washington Department of Fish and Wildlife, Olympia, Washington.
+
+Time trends of persistent organic pollutants in benthic and pelagic indicator fishes from Puget Sound
+
+Split PDF in single pages needed for daiR package
+```{r split_pdf, include=FALSE}
+
+savedir.pdf <- "~/readpcbpdfs/inputs/west2001"
+dir.create(savedir.pdf)
+
+pdf.list <- list.files(savedir.pdf, pattern = "*.*pdf", full.names = TRUE)
+
+if(rlang::is_empty(pdf.list)==TRUE) {
+
+tabulapdf::split_pdf("~/readpcbpdfs/inputs/tables_West_2001.pdf", outdir = savedir.pdf)
+  
+}
+
+
+```
+
+Get species from googlesheets 
+```{r get_species}
+
+#tables have text with species names that was not straightforward to extract
+# so I extracted it manually
+
+googlesheets4::gs4_deauth()
+species.link <- "1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU"
+sp.sheet <- googlesheets4::read_sheet(species.link, sheet="species")
+
+num.rows <- 1:nrow(sp.sheet)
+sp.list <- lapply(num.rows, get_sp, sp.sheet)
+
+sp.names <- purrr::list_c(sp.list)
+
+```
+
+Extract tables
+```{r get_tables, echo=FALSE}
+savedir.pdf <- "~/readpcbpdfs/inputs/west2001"
+
+pdf.list <- list.files(savedir.pdf, pattern = "*.*pdf", full.names = TRUE)
+
+no.pdf.files <- 1:length(pdf.list)
+
+#This function extracts all text from the PDF
+#ocr.text <- pdftools::pdf_ocr_text(pdf.list[1])
+
+tables.file <- lapply(no.pdf.files, get_table, pdf.list, sp.names) 
+
+tables.data <- tables.file %>% 
+  dplyr::bind_rows()
+
+# tried package daiR which uses Google Document AI OCR but it could not distinguish the two first columns
+# https://dair.info/articles/tables.html
+#processors <- daiR::create_processor("atlantis-pcb-table-processor", type = "FORM_PARSER_PROCESSOR")
+#tables.raw <- daiR::dai_sync(pdf.list[1], proc_id = "6e5afc64cb0fea45")
+#tables.extracted <- daiR::get_tables(tables.raw)
+
+```
+
+#Extract 
+Burd, B. J., T. A. Macdonald, R. W. Macdonald, and P. S. Ross. 2014. Distribution and uptake of key polychlorinated biphenyl and polybrominated diphenyl ether congeners in benthic infauna relative to sediment organic enrichment. Archives of environmental contamination and toxicology 67:310–334.
+```{r}
+
+```
+
+
+#Extract 
+Conn, K.E., and Black, R.W., 2014, Data compilation for assessing sediment and toxic chemical loads from the Green River to the lower Duwamish Waterway, Washington: U.S. Geological Survey Data Series 880, 46 p., http://dx.doi. org/10.3133/ds880.
+
+```{r}
+#stored in Google sheets
+sheet.link <- "https://docs.google.com/spreadsheets/d/1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU/edit?gid=385519610#gid=385519610"
+```
+
+
+#Extract
+WADOE, 2015. Bellingham Bay Regional Background Sediment Characterization. Washington State Department of Ecology Toxics Cleanup Program Olympia, WA.
+
+```{r}
+
+```
+
+#Extract
+Ross, P. S., H. Frouin, N. J. Dangerfield, N. F. Crewe, C. Dubetz, M. B. Fischer, T. L. Fraser, and A. R. S. Ross. 2012. Sediment concentrations of PCBs, PBDEs, PCDDs and PCDFs from disposal at sea sites at Brown Passage and Douglas Channel, British Columbia in 2011. Canadian Data Report of Fisheries and Aquatic Sciences 1243.
+
+```{r}
+
+```
+
+#Extract
+WADOE. 2013. Port Gardner Bay Regional Background Sediment Characterization. Washington Department of Ecology. Publication no. 13-09-049.
+
+C/C180 – the C indicates the congener co-elutes as a congener pair, if the C is followed by a number the results are reported with 
+the congener pair 
+U- the analyte was analyzed for but not detected 
+J – the analyte was positively identified, the associated numerical value is the approximate concentration of the analyte in the 
+sample 
+B- analyte found in the sample and the associated blank 
+K – identifies a target that could not be confirmed by virtue of not satisfying all method required criteria, the reported value may 
+be interpreted as an estimated maximum analyte concentration 
+TEQ – toxicity equivalency 

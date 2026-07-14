@@ -1,0 +1,84 @@
+---
+title: "Read PCB database spreadsheet"
+author: "H Morzaria-Luna"
+date: "2025-12-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# remotes::install_github(c("ropensci/tabulapdf"))
+# usethis::use_package("daiR")
+# usethis::use_package("tesseract")
+# usethis::use_package("googlesheets4")
+# usethis::use_package("dplyr")
+library(magrittr)
+devtools::load_all()
+```
+
+This is the start of the analysis
+
+``` {r readsheets, include=FALSE}
+googlesheets4::gs4_deauth()
+database.link <- "1zmYEiVVxarWLrcy2x-qMKs6-mlwCrC7P3saNnv6EPlQ" # file PCB concentrations PS https://docs.google.com/spreadsheets/d/1zmYEiVVxarWLrcy2x-qMKs6-mlwCrC7P3saNnv6EPlQ/edit?gid=1030069929#gid=1030069929
+db.sheet.names <- googlesheets4::sheet_names(database.link)
+sheets.ignore <- c("metadata","ref_list","general_locs","locs_WSDH_2006")
+
+sheet.data <- tidyr::tibble(sheet_name=db.sheet.names) %>% 
+  dplyr::filter(!sheet_name %in% sheets.ignore)
+
+num.sheets <- 1:nrow(sheet.data)
+
+database.values <- lapply(num.sheets, get_datasheets, sheet.data, database.link)
+
+database.tibble <- database.values %>% 
+  dplyr::bind_rows() %>% 
+  dplyr::mutate(functional_group=dplyr::if_else(functional_group=="Sediment","sediment",functional_group)) %>% 
+  dplyr::filter(!is.na(concentration)) %>% 
+  dplyr::mutate(year=as.factor(year))
+
+readr::write_csv(database.tibble, here::here("outputs","raw_pcb_concentrations.csv"), append = FALSE)  
+
+```
+
+Conversions to standarize database
+
+```{r}
+
+database.tibble <- readr::read_csv(here::here("outputs","raw_pcb_concentrations.csv"))  
+
+#standarize units
+
+database.tibble %>% dplyr::distinct("units") %>% View()
+  
+```
+
+
+
+
+```{r}
+database.tibble %>% dplyr::filter(sample=="NA") %>% dplyr::distinct(citation) %>% View()
+
+
+unique(database.tibble$year)
+
+database.tibble %>% dplyr::filter(year=="18.8")
+database.tibble %>% dplyr::filter(year=="NA") %>% View()
+
+na.data <- database.tibble %>% dplyr::filter(is.na(concentration)) %>% 
+  dplyr::distinct(citation)
+
+
+conc.plot <- database.tibble %>% 
+   ggplot2::ggplot(ggplot2::aes(x= sample, y = concentration, colour = functional_group))+
+  ggplot2::geom_point() +
+  ggplot2::facet_grid(.~ functional_group)+
+  ggplot2::labs(title= "Congener:total PCB ratio", 
+                subtitle = "West et al. 2001",
+                y="Percent of total PCBs",
+                x= "Atlantis polygon")
+
+ratio.loc.plot
+
+```
+

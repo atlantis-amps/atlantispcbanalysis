@@ -1,0 +1,74 @@
+---
+title: "Read PCB concentrations from large tables"
+output: html_notebook
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+remotes::install_github(c("ropensci/tabulapdf"))
+# usethis::use_package("daiR")
+# usethis::use_package("tesseract")
+# usethis::use_package("googlesheets4")
+# usethis::use_package("dplyr")
+library(magrittr)
+devtools::load_all()
+```
+
+Correct tables with wide format where each column is a congener
+```{r}
+
+sheets.mod <- c("wright_2008_2","ross_et_al_2013_b")
+
+googlesheets4::gs4_deauth()
+pcb.conc <- "1zmYEiVVxarWLrcy2x-qMKs6-mlwCrC7P3saNnv6EPlQ"
+sp.sheet <- googlesheets4::read_sheet(pcb.conc, sheet=sheets.mod[1])
+names(sp.sheet)
+sp.sheet.mod <- sp.sheet %>% 
+  tidyr::pivot_longer(cols = (tidyr::starts_with("PCB")), names_to="congener", values_to="value") %>% 
+  tidyr::separate_wider_delim(cols="congener", delim = "B", names = c("pc", "no_congener")) %>% 
+  dplyr::select(-pc, -TOC)
+
+readr::write_csv(sp.sheet.mod, here::here("data",paste0(sheets.mod[1],".csv")))
+
+
+googlesheets4::gs4_deauth()
+pcb.conc <- "1zmYEiVVxarWLrcy2x-qMKs6-mlwCrC7P3saNnv6EPlQ"
+sp.sheet <- googlesheets4::read_sheet(pcb.conc, sheet=sheets.mod[2])
+names(sp.sheet)
+sp.sheet.mod <- sp.sheet %>% 
+  tidyr::pivot_longer(cols = (tidyr::starts_with("PCB")), names_to="congener", values_to="value") %>% 
+  tidyr::separate_wider_delim(cols="congener", delim = "B", names = c("pc", "no_congener")) %>% 
+  dplyr::select(-pc)
+
+readr::write_csv(sp.sheet.mod, here::here("data",paste0(sheets.mod[2],".csv")))
+
+```
+
+
+```{r}
+sheets.mod <- c("bolton_unpublished")
+
+googlesheets4::gs4_deauth()
+pcb.conc <- "1zmYEiVVxarWLrcy2x-qMKs6-mlwCrC7P3saNnv6EPlQ"
+sp.sheet <- googlesheets4::read_sheet(pcb.conc, sheet=sheets.mod[1])
+names(sp.sheet)
+
+sp.sheet.mod <- sp.sheet %>% 
+  tidyr::pivot_longer(cols = "17":"tot_pcb", names_to="PCB_congener", values_to="concentration")  %>% 
+  dplyr::mutate(atlantis_polygon=as.character(atlantis_polygon)) %>% 
+  tidyr::unnest(cols = "atlantis_polygon") %>% 
+  dplyr::select(functional_group, common_name, sample_id, concentration, value, everything())
+
+readr::write_csv(sp.sheet.mod, here::here("data",paste0(sheets.mod[1],".csv")))
+
+
+
+
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
