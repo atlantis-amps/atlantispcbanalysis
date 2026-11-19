@@ -1,0 +1,1061 @@
+---
+title: "Chloe Sprague PCB Initial Conditions Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(tidyverse)
+library(googlesheets4)
+library(here)
+```
+
+
+Filtering the "PCB concentrations organisms" Google Sheet. Removed the tabs that did not include concentration data. Some issues with different formatting between tabs, so I converted all to either character or numeric values.
+```{r}
+googlesheets4::gs4_deauth()
+pcb.conc <- "1zmYEiVVxarWLrcy2x-qMKs6-mlwCrC7P3saNnv6EPlQ"
+tabs <- sheet_names(pcb.conc)
+tabs <- setdiff(tabs, c("metadata", "ref_list", "general_locs", "locs_WSDH_2006", "atlantis_groups", "units_conversion"))
+clean_sheet <- function(tab) {
+  df <- read_sheet(pcb.conc, sheet = tab)
+  for (col in names(df)) {
+    if (is.list(df[[col]])) {
+      df[[col]] <- sapply(df[[col]], function(x) {
+        if (length(x) == 0) NA else as.character(x[1])})}}
+  numeric_cols <- c(
+    "concentration",
+    "SD",
+    "SE",
+    "max",
+    "min",
+    "n",
+    "year",
+    "lat",
+    "lon",
+    "%lipids")
+  df <- df %>%
+  mutate(across(everything(), as.character))
+df <- df %>%
+  mutate(
+    across(
+      any_of(numeric_cols),
+      ~ suppressWarnings(as.numeric(.x))))
+  df <- df %>%
+    mutate(citation = tab)
+return(df)}
+```
+
+Compiling all studies in the "PCB concentrations organisms" Google Sheets to a master dataset csv. Filtered out the "NA" Atlantis Polygon to only include data within the study site. Renamed "%lipids" column to percent_lipid because R had issues with the % symbol.
+```{r}
+master_dataset <- map_dfr(tabs, function(tab) {
+  Sys.sleep(2)
+  clean_sheet(tab)})
+write.csv(
+  master_dataset,
+  here::here("data", "master_dataset.csv"),
+  row.names = FALSE)
+
+master_dataset <- master_dataset %>%
+  filter(!is.na(atlantis_polygon),
+         atlantis_polygon != "NA")
+
+master_dataset <- master_dataset %>%
+  rename(percent_lipid = `%lipids`)
+```
+
+Filtering the "PCB data for congener contribution" Google Sheets. Removed the tabs that did not include congener concentration data. This data was used to estimate target congener concentrations in mixtures.
+```{r}
+mix <- "https://docs.google.com/spreadsheets/d/1w5p-vemW2PjKbVQF-aWT5vi_CtTNdqeoOUr9lpMOTQU/edit?gid=452966458#gid=452966458"
+mix <- sheet_names
+mix <- setdiff(mix, c("species", "species_ufws", "ufws_locations", "holbert_2024", "burd2014", "west2001_locations"))
+
+googlesheets4::gs4_deauth()
+mixtures <- map_dfr(mix, function(tab) {
+  df <- read_sheet(mix, sheet = tab)
+  df <- df %>%
+    mutate(
+      across(
+        where(is.list),
+        ~ sapply(.x, function(x) paste(x, collapse = ", "))))
+  df$citation <- tab
+  df})
+```
+
+Reading Aroclor data from the "PCB_data_AMPS_initial_conditions" Google Sheet. Used to estimate target congener concentrations in Aroclor data.
+```{r}
+aroclor_profile <- read_sheet(
+  "https://docs.google.com/spreadsheets/d/1X0Osvfe5_27rWOBL-iajtPNSehfC4RWiP0HbO_en_BE/edit?gid=59131839#gid=59131839",
+  sheet = "Aroclor_congener_profile")
+```
+
+Concentration values were represented in three different ways: total, mean, and geometric mean. 47 observations did not specify.
+```{r}
+unique(master_dataset$value)
+table(master_dataset$value)
+```
+
+
+List of units used in each study and sample type. Counts for how many observations use each unit.
+```{r}
+
+(units_by_study <- master_dataset %>%
+  select(citation, units, sample) %>%
+  distinct() %>%
+  arrange(citation))
+
+write.csv(
+  units_by_study,
+  "units_by_study.csv",
+  row.names = FALSE)
+
+(unit_summary <- master_dataset %>%
+  distinct(citation, units) %>%
+  count(units, sort = TRUE))
+```
+
+Graph showing frequency of each sample type across all studies. We noticed many different variations in spelling, so we standardized in the Google Sheet.
+```{r}
+(sample_types <- master_dataset %>%
+  distinct(citation, sample) %>%
+  count(sample))
+
+ggplot(sample_types,
+       aes(x=reorder(sample,n),
+           y=n)) +
+  labs(y="Number of studies", x="Sample type") +
+  geom_col() +
+  coord_flip() +
+  theme_classic()
+```
+
+
+
+Lee 2023 study presented as amount of PCBs per polyethylene sheet. We converted their data from ng/PE to mg/m^3. 
+```{r}
+master_dataset <- master_dataset %>%
+  mutate(
+    concentration = case_when(
+      citation == "lee_2023" & PCB_congener == "11" ~ concentration / (4.23 * 0.0014 * 1.025),
+      citation == "lee_2023" & PCB_congener == "28" ~ concentration / (5.40 * 0.0014 * 1.025),
+      citation == "lee_2023" & PCB_congener == "52,73" ~ concentration / (5.95 * 0.0014 * 1.025),
+      citation == "lee_2023" & PCB_congener == "101,89,90" ~ concentration / (6.18 * 0.0014 * 1.025),
+      TRUE ~ concentration),
+    units = case_when(
+      citation == "lee_2023" ~ "ng/kg wet weight",
+      TRUE ~ units))
+```
+
+
+Converting lipid weight to wet weight in a data subset. Converted each unit to mg/kg lipid weight. Some studies did not report %lipid, so we found the average %lipid in similar species and sample types in the master dataset. Made a column called percent_lipid_used to coalesce the %lipids provided and averaged through similar species (prioritizing the values provided in each study and filling in any blanks with the averaged values). Converted lipid weight to wet weight by multiplying the mg/kg lipid weight concentrations by percent_lipid_used multiplied by 100.
+```{r}
+lipid_dataset <- master_dataset %>%
+  filter(
+    !grepl("dry weight|wet weight|wet wt|fish|ng/L", units, ignore.case = TRUE))
+
+(lipid_units <- lipid_dataset %>%
+  distinct(citation, units) %>%
+  count(units, sort = TRUE))
+
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    concentration_mgkg_lipid = case_when(
+      units == "mg/kg lipid weight" ~ concentration,
+      units == "ug/g lipid weight" ~ concentration,
+      units == "ug/kg lipid weight" ~ concentration / 1000,
+      units == "ng/kg lipid weight" ~ concentration / 1e6,
+      units == "pg/g lipid weight" ~ concentration / 1e6,
+      units == "pg/kg lipid weight" ~ concentration / 1e9,
+      TRUE ~ NA_real_))
+
+mean_lipid <- master_dataset %>%
+  filter(!is.na(percent_lipid)) %>%
+  group_by(common_name, sample) %>%
+  summarise(
+    mean_percent_lipid = mean(percent_lipid, na.rm = TRUE),
+    .groups = "drop")
+
+lipid_dataset <- lipid_dataset %>%
+  left_join(
+    mean_lipid,
+    by = c("common_name", "sample"))
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    percent_lipid_used = coalesce(percent_lipid, mean_percent_lipid))
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    concentration_mgkg =
+      concentration_mgkg_lipid * (percent_lipid_used / 100))
+
+lipid_dataset %>%
+  filter(is.na(percent_lipid_used)) %>%
+  distinct(common_name, sample)
+
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    lipid_group = case_when(
+      common_name %in% c("Crab", "Dungeness Crab", "Graceful crab", "crab") ~ "Crab",
+      common_name %in% c("Chinook", "Coho", "Sockeye", "Pink salmon", "Chum", "Estuary Chinook", "Hatchery Chinook") ~ "Salmon",
+      common_name %in% c("Brown Rockfish", "Copper Rockfish", "Quillback Rockfish", "Rockfish") ~ "Rockfish",
+      common_name %in% c("Ghost shrimp", "Spot prawn") ~ "Crustacean",
+      common_name %in% c("Butter Clam", "Geoduck clam", "Manila clam") ~ "Bivalve",
+      TRUE ~ common_name)) %>%
+  group_by(lipid_group, sample)
+
+group_means <- master_dataset %>%
+  mutate(
+    lipid_group = case_when(
+      common_name %in% c("Crab", "Dungeness Crab", "Graceful crab", "crab") ~ "Crab",
+      common_name %in% c("Chinook", "Coho", "Sockeye", "Pink salmon", "Chum") ~ "Salmon",
+      common_name %in% c("Brown Rockfish", "Copper Rockfish", "Quillback Rockfish", "Rockfish") ~ "Rockfish",
+      TRUE ~ common_name)) %>%
+  filter(!is.na(percent_lipid)) %>%
+  group_by(lipid_group, sample) %>%
+  summarise(mean_group_lipid = mean(percent_lipid), .groups = "drop")
+
+lipid_dataset <- lipid_dataset %>%
+  left_join(group_means, by = c("lipid_group", "sample"))
+
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    percent_lipid_used = coalesce(percent_lipid_used, mean_group_lipid))
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    percent_lipid_used = case_when(
+      common_name %in% c("Heron egg", "Great blue heron eggs", "heron eggs", "blue heron", "Cormorant egg", "double-crested cormorants", "pelagic cormorants") &
+        sample == "eggs" ~ 12.38,
+        TRUE ~ percent_lipid_used))
+
+
+(fish_mean <- master_dataset %>%
+  filter(
+    sample == "whole body",
+    !is.na(percent_lipid),
+    functional_group %in% c(
+      "SMD", "ROC", "FDF", "Fish")) %>%
+  summarise(mean_fish_lipid = mean(percent_lipid, na.rm = TRUE)))
+
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    percent_lipid_used = case_when(
+      is.na(percent_lipid_used) &
+        common_name %in% c(
+          "Rockfish",
+          "Pacific lingcod",
+          "Pacific tomcod",
+          "Pacific hake",
+          "Pacific midshipman"
+        ) &
+        sample == "whole body" ~ 1.27506,
+      TRUE ~ percent_lipid_used))
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    percent_lipid_used = case_when(
+      is.na(percent_lipid_used) &
+        common_name %in% c(
+          "Ghost shrimp",
+          "Spot prawn",
+          "crab") &
+        sample == "muscle" ~ 2.6,
+      TRUE ~ percent_lipid_used))
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    percent_lipid_used = case_when(
+      is.na(percent_lipid_used) &
+        common_name == "California sea lion" &
+        sample == "blood" ~ 2.64,
+      TRUE ~ percent_lipid_used))
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    percent_lipid_used = case_when(
+      is.na(percent_lipid_used) &
+        common_name == "crab" &
+        sample == "hepatopancreas" ~ 8.5,
+      TRUE ~ percent_lipid_used))
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    percent_lipid_used = case_when(
+      is.na(percent_lipid_used) &
+        common_name == "Butter Clam" &
+        sample == "muscle" ~ 2,
+      TRUE ~ percent_lipid_used))
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    percent_lipid_used = case_when(
+      is.na(percent_lipid_used) &
+        common_name == "zooplankton" &
+        sample %in% c("muscle", "whole body") ~ 2.3,
+      TRUE ~ percent_lipid_used))
+
+
+lipid_dataset %>%
+  filter(is.na(percent_lipid_used)) %>%
+  distinct(common_name, sample)
+
+lipid_dataset <- lipid_dataset %>%
+  mutate(
+    concentration_mgkg =
+      concentration_mgkg_lipid * (percent_lipid_used / 100))
+```
+
+Standardizing units in the wet weight data subset. Converted all units to mg/kg, then combined the corrected values of the lipid weight dataset with the wet weight dataset.
+```{r}
+wet_dataset <- master_dataset %>%
+  filter(
+    !grepl("dry weight|lipid weight", units, ignore.case = TRUE))
+
+(wet_units <- wet_dataset %>%
+  distinct(citation, units) %>%
+  count(units, sort = TRUE))
+
+wet_dataset <- wet_dataset %>%
+  mutate(
+    concentration_mgkg = case_when(
+      units == "mg/kg wet weight" ~ concentration,
+      units == "ug/g wet weight" ~ concentration,
+      units == "ug/kg wet weight" ~ concentration / 1000,
+      units == "ng/kg wet weight" ~ concentration / 1e6,
+      units == "pg/g wet weight" ~ concentration / 1e6,
+      units == "pg/kg wet weight" ~ concentration / 1e9,
+      units == "ng/L" ~ concentration / 1025000,
+      TRUE ~ NA_real_))
+
+(common_cols <- intersect(names(lipid_dataset), names(wet_dataset)))
+
+wet_dataset_new <- bind_rows(
+  lipid_dataset[, common_cols],
+  wet_dataset[, common_cols])
+```
+
+Converting wet weight dataset units from mg/kg to mg/m^3 using average density of the sample type.
+```{r}
+wet_dataset_new <- wet_dataset_new %>%
+  mutate(
+    concentration_mgm3 = case_when(
+      sample %in% c("whole body", "tissue", "whole body weighted-composite", "section weighted-composite", "embryo", "muscle", "composite") ~ concentration_mgkg * 1090,
+      sample == "blood" ~ concentration_mgkg * 1050,
+      sample == "blood and bile" ~ concentration_mgkg * 989,
+      sample == "blubber" ~ concentration_mgkg * 911,
+      sample == "digestive tract" ~ concentration_mgkg * 1069,
+      sample == "gonad" ~ concentration_mgkg * 1065,
+      sample == "muscle and bile" ~ concentration_mgkg * 1009,
+      sample %in% c("sediment", "surface sediment") ~ concentration_mgkg * 1400,
+      sample == "eggs" ~ concentration_mgkg * 1075,
+      sample == "liver" ~ concentration_mgkg * 1079,
+      sample == "hepatopancreas" ~ concentration_mgkg * 1087,
+      sample == "stomach content" ~ concentration_mgkg * 1000,
+      sample %in% c("roots", "shoots") ~ concentration_mgkg * 1250,
+      sample == "Particulate Organic Matter" ~ concentration_mgkg * 1230,
+      sample == "sea water" ~ concentration_mgkg * 1025,
+      TRUE ~ NA_real_))
+```
+
+
+Standardizing the dry weight data subset. Converting to mg/kg units then to mg/m^3 using average density of sample type.
+```{r}
+dry_dataset <- master_dataset %>%
+  filter(
+    !grepl("wet weight|lipid weight|ng/L", units, ignore.case = TRUE))
+
+(dry_units <- dry_dataset %>%
+  distinct(citation, units) %>%
+  count(units, sort = TRUE))
+
+dry_dataset <- dry_dataset %>%
+  mutate(
+    concentration_mgkg = case_when(
+      units == "mg/kg dry weight" ~ concentration,
+      units == "ug/g dry weight" ~ concentration,
+      units == "ug/kg dry weight" ~ concentration / 1000,
+      units == "ng/kg dry weight" ~ concentration / 1e6,
+      units == "pg/g dry weight" ~ concentration / 1e6,
+      units == "g/kg dry weight" ~ concentration * 1000,
+      TRUE ~ NA_real_))
+
+dry_dataset <- dry_dataset %>%
+  mutate(
+    concentration_mgm3 = case_when(
+      sample %in% c("whole body", "tissue", "whole body weighted-composite", "section weighted-composite", "embryo", "muscle", "composite") ~ concentration_mgkg * 1090,
+      sample == "blood" ~ concentration_mgkg * 1050,
+      sample == "blood and bile" ~ concentration_mgkg * 989,
+      sample == "blubber" ~ concentration_mgkg * 911,
+      sample == "digestive tract" ~ concentration_mgkg * 1069,
+      sample == "gonad" ~ concentration_mgkg * 1065,
+      sample == "muscle and bile" ~ concentration_mgkg * 1009,
+      sample %in% c("sediment", "surface sediment") ~ concentration_mgkg * 1400,
+      sample == "eggs" ~ concentration_mgkg * 1075,
+      sample == "liver" ~ concentration_mgkg * 1079,
+      sample == "hepatopancreas" ~ concentration_mgkg * 1087,
+      sample == "stomach content" ~ concentration_mgkg * 1000,
+      sample %in% c("roots", "shoots") ~ concentration_mgkg * 1250,
+      sample == "Particulate Organic Matter" ~ concentration_mgkg * 1230,
+      sample == "sea water" ~ concentration_mgkg * 1025,
+      TRUE ~ NA_real_))
+
+```
+
+Wet and dry data were both converted to volumetric measurements rather than mass-based, so they can now be combined to create the new standardized master dataset.
+```{r}
+(common_cols <- intersect(names(wet_dataset_new), names(dry_dataset)))
+
+master <- bind_rows(
+  wet_dataset_new %>% select(all_of(common_cols)),
+  dry_dataset %>% select(all_of(common_cols)))
+```
+
+
+
+
+Exploratory congener figures. Coelutions were represented differently in each study (parentheses, forward slashes, plus sign). We chose to rewrite these as comma separated for consistency, similar to mixtures of multiple congeners. Exploratory graph to show the 20 most common congeners reported across all studies.
+```{r}
+master$PCB_congener <- gsub("\\(", ",", master$PCB_congener)
+master$PCB_congener <- gsub("\\)", "", master$PCB_congener)
+master$PCB_congener <- gsub("/", ",", master$PCB_congener)
+master$PCB_congener <- gsub("\\s*\\+\\s*", ",", master$PCB_congener)
+
+
+master <- master %>%
+  mutate(
+    PCB_congener = case_when(
+      no_congener != 209 &
+        str_to_lower(str_trim(PCB_congener)) %in% c("tot_pcb", "TOTAL PCBs") &
+        !is.na(congeners_analyzed) &
+        str_trim(congeners_analyzed) != "" &
+        str_to_lower(str_trim(congeners_analyzed)) != "na" ~
+          congeners_analyzed,
+      TRUE ~ PCB_congener))
+
+
+master <- master %>%
+  ungroup()
+
+master %>%
+  group_by(PCB_congener) %>%
+  summarise(n = n())
+
+congener_counts <- master %>%
+  distinct(citation, PCB_congener) %>%
+  count(PCB_congener, sort = TRUE)
+
+master %>%
+  count(PCB_congener, sort = TRUE) %>%
+  slice_head(n = 20) %>%
+  ggplot(aes(x = reorder(PCB_congener, n), y = n)) +
+  geom_col() +
+  labs(
+    x = "PCB congener analyzed",
+    y = "Number of observations") +
+  theme_bw() +
+  coord_flip()
+```
+Grouping PCB_congener type into total (all 209 congeners), known mixtures (less than 209 congeners in the mixture), unknown mixtures (studies reported that multiple congeners were included in the values but didn't specify which), and individual congener concentrations. Graph showing frequency of each type. There were originally over a thousand unknown mixture observations, but I went back to studies to find supplementary data and information and was able to narrow it down.
+```{r}
+master <- master %>%
+  mutate(
+    pcb_type = case_when(
+      str_detect(str_to_lower(PCB_congener), "total|tot_pcb") &
+        no_congener == 209 ~ "Total PCB (209 congeners)",
+      str_detect(str_to_lower(PCB_congener), "total|tot_pcb") &
+        !is.na(congeners_analyzed) &
+        str_to_lower(congeners_analyzed) != "na" ~ "Known mixture",
+      str_detect(str_to_lower(PCB_congener), "total|tot_pcb") &
+        (is.na(congeners_analyzed) |
+         str_to_lower(congeners_analyzed) == "na") ~ "Unknown mixture",
+      str_detect(str_to_lower(PCB_congener), "aroclor") ~ "Aroclor mixture",
+      str_detect(PCB_congener, ",") ~ "Known mixture",
+      TRUE ~ "Individual congener"))
+
+master %>%
+  count(pcb_type) %>%
+  ggplot(aes(x = reorder(pcb_type, n), y = n)) +
+  geom_col() +
+  geom_text(
+    aes(label = n),
+    hjust = -0.2) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    x = "PCB measurement type",
+    y = "Number of observations") +
+  theme_bw()
+
+
+```
+
+
+Graph showing the 20 most common congeners included in known mixtures. The target congeners 118, 138, and 153 were in the top four most common. Graph showing the 20 most frequent mixtures (unfortunately this includes coelutions). I later filter out the coelutions from the known mixture subset, so this graph could be recreated to exclude the coelutes. Graph showing the 20 most frequent congeners reported in individual congener.
+```{r}
+mixture_congeners <- master %>%
+  filter(pcb_type == "Known mixture") %>%
+  separate_rows(PCB_congener, sep = ",") %>%
+  mutate(PCB_congener = str_trim(PCB_congener)) %>%
+  count(PCB_congener, sort = TRUE)
+
+
+#20 most frequent congeners reported in known mixtures
+mixture_congeners %>%
+  slice_head(n = 20) %>%
+  ggplot(aes(x = reorder(PCB_congener, n), y = n)) +
+  geom_col() +
+  geom_text(
+    aes(label = n),
+    hjust = -0.2) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    x = "PCB congener",
+    y = "Number of occurrences in known mixtures") +
+  theme_bw()
+
+
+#20 most frequent known mixtures
+master %>%
+  filter(pcb_type == "Known mixture") %>%
+  count(PCB_congener, sort = TRUE) %>%
+  slice_head(n = 30) %>%
+  ggplot(aes(x = reorder(PCB_congener, n), y = n)) +
+  geom_col() +
+  geom_text(
+    aes(label = n),
+    hjust = -0.2) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    x = "PCB congener mixture",
+    y = "Number of observations",
+    title = "Most frequent mixtures") +
+  theme_bw() +
+    theme(
+    axis.text.y = element_text(size = 8))
+
+# Number of studies that report unknown mixtures
+master %>%
+  filter(pcb_type == "Unknown mixture") %>%
+  summarise(n_studies = n_distinct(citation))
+
+
+#20 most frequently reported individual congeners
+master %>%
+  filter(pcb_type == "Individual congener") %>%
+  count(PCB_congener, sort = TRUE) %>%
+  slice_head(n = 20) %>%
+  ggplot(aes(x = reorder(PCB_congener, n), y = n)) +
+  geom_col() +
+  geom_text(
+    aes(label = n),
+    hjust = -0.2) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    x = "PCB congener",
+    y = "Number of observations",
+    title = "20 Most Common Individual PCB Congeners") +
+  theme_bw()
+```
+
+
+
+Graph showing the frequency of each Aroclor.
+```{r}
+master %>%
+  filter(pcb_type == "Aroclor mixture") %>%
+  count(PCB_congener, sort = TRUE) %>%
+  ggplot(aes(x = reorder(PCB_congener, n), y = n)) +
+  geom_col() +
+  geom_text(
+    aes(label = n),
+    hjust = -0.2) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    x = "Aroclor mixture",
+    y = "Number of observations") +
+  theme_bw()
+```
+
+Reading the Aroclor profile sheet in the "PCB_data_AMPS_initial_conditions" Google Sheet. Issues with joining with the master sheet, so I defined the format as character.
+```{r}
+aroclor_congener <- read_sheet("https://docs.google.com/spreadsheets/d/1X0Osvfe5_27rWOBL-iajtPNSehfC4RWiP0HbO_en_BE/edit?gid=59131839#gid=59131839", sheet = "Aroclor_congener_profile")
+
+aroclor_congener <- aroclor_congener %>%
+  mutate(Aroclor = as.character(Aroclor))
+
+aroclors <- master %>%
+  left_join(
+    aroclor_congener,
+    by = c("PCB_congener" = "Aroclor"))
+```
+
+Recreating known mixtures to estimate concentrations of target congeners 118, 138, and 153.
+
+Standardizing formatting. Redefining Total Pentachloro Biphenyls and Total Hexachloro Biphenyls as lists of the congeners included - only redefining these groups because they include the target congeners. Removing coelutions from being counted towards known mixtures. For simplicity, treating coelution concentrations as single congeners. Narrowing down the known mixtures to remove duplicates of mixtures per organism. 
+```{r}
+master$PCB_congener <- gsub("\\(", ",", master$PCB_congener)
+master$PCB_congener <- gsub("\\)", "", master$PCB_congener)
+master$PCB_congener <- gsub("/", ",", master$PCB_congener)
+master$PCB_congener <- gsub("\\s*\\+\\s*", ",", master$PCB_congener)
+master$PCB_congener <- gsub("\\s*_\\s*", ",", master$PCB_congener)
+master$PCB_congener <- gsub("\\s+", "", master$PCB_congener)
+
+master <- master %>%
+  mutate(
+    PCB_congener = case_when(
+      PCB_congener == "Total Pentachloro Biphenyls" ~ "82,83,99,84,85,116,117,86,87,97,109,119,125,88,91,89,90,101,113,92,93,95,98,100,102,94,96,103,104,105,106,107,108,124,110,115,111,112,114,118,120,121,122,123,126,127",
+      TRUE ~ PCB_congener))
+master <- master %>%
+  mutate(
+    PCB_congener = case_when(
+      PCB_congener == "Total Hexachloro Biphenyls" ~ "128,166,129,138,160,163,130,131,132,133,134,143,135,151,154,136,137,139,140,141,142,144,145,146,147,149,148,150,152,153,168,155,156,157,158,159,161,162,164,165,167,169",
+      TRUE ~ PCB_congener))
+
+
+filtered_master <- master %>%
+  filter(pcb_type == "Known mixture", !citation %in% c("condon_2007", "din_et_al_2011", "kelly_2007", "lee_2023", "arblaster_2015"), !no_congener %in% c("209"), !PCB_congener %in% c("156,157", "101,90", "138,163,164", "153,132", "187,159,182", "61,70,74,76", "153,168", "110,115", "20,28", "61,70,74,76", "153,168", "129,138,160,163", "44,47,65", "129,138,160", "180,193", "147,149", "12,13", "18,30", "21,33", "26,29", "40,41,47", "45,51", "49,69", "50,53", "59,62,75", "83,99", "85,116,117", "86,87,97,109,119,125", "88,91", "90,101,113", "93,95,98,100,102", "108,124", "128,166", "134,143", "135,151,154", "139,140", "171,173", "183,185", "197,200", "198,199", "40,41,71", "TotalMonochloroBiphenyls", "TotalDichloroBiphenyls", "TotalTrichloroBiphenyls", "TotalTetrachloroBiphenyls", "TotalHeptachloroBiphenyls", "TotalOctachloroBiphenyls", "TotalNonachloroBiphenyls")) %>%
+  select(
+    citation,
+    common_name,
+    PCB_congener,
+    no_congener,
+    congeners_analyzed,
+    concentration_mgm3
+  ) %>%
+  distinct()
+
+master_congeners <- filtered_master %>%
+  separate_rows(PCB_congener, sep = ",") %>%
+  mutate(congener = trimws(PCB_congener))
+
+
+mixture_congeners <- mixtures %>%
+  filter(
+    !is.na(`IUPAC Number`),
+    grepl("^[0-9]+$", as.character(`IUPAC Number`))) %>%
+  mutate(
+    congener = as.character(`IUPAC Number`),
+    concentration = as.numeric(Concentrations))
+
+unique(master_congeners$common_name)
+
+master_congeners <- filtered_master %>%
+  mutate(
+    mixtures_tab = case_when(
+      common_name %in% c(
+        "Northern Resident killer whale", "Southern Resident killer whale", "Transient killer whale", "humpback whale", "Offshore", "Southern resident killer whale", "humpback whales", "Killer whales") ~ "whale",
+      common_name %in% c(
+        "Chum", "Coho", "Chinook", "Rockfish", "Pacific lingcod", "English sole", "Pacific tomcod", "Pacific hake", "Pacific herring", "Pacific midshipman", "Pacific sand lance", "Sockeye", "Estuary Chinook", "Hatchery Chinook", "Rock sole", "Staghorn sculpin", "Shiner surf perch", "Sand sole", "Spotted Ratfish", "Spiny dogfish", "sixgill shark", "Irish Lord", "Midshipman", "salmon", "Chinook/coho salmon", "Quillback rockfish", "Surf smelt", "Northern anchovy", "ratfish", "sand sole", "shiner surf perch", "staghorn sculpin", "Forage fish", "Sole", "Whitespotted greenling", "Small forage fish", "Surf scoter", "Striped seaperch", "Pacific staghorn sculpin", "Pile perch", "Blackmouth salmon", "Pink salmon", "Ratfish", "Quillback rockfish (Sebastes maliger), brown rockfish (S.auriculatus) and copper rockfish (S. caurinus)", "Brown Rockfish", "Copper Rockfish", "Quillback Rockfish", "herring", "speckled sanddab") ~ "fish",
+      common_name %in% c(
+        "crab", "Ghost shrimp", "Spot prawn", "Butter Clam", "Benthic invertebrates", "Graceful crab", "Sea cucumber", "mussel", "whole benthos", "echinoderm", "horse mussel", "scallops", "Subtidal bivalves", "Polychaete", "Cerebratulus", "Heteromastus", "intertidal clams", "sea cucumber", "mussels", "Pacific oyster", "Geoduck clam", "Purple seastar", "Manila clam", "Blue mussel",  "Dungeness crab", "Crab", "Mussels", "Dungeness Crab", "Euphausia pacifica", "Thysanoessa raschii", "Thysanoessa spinifera", "Community/Benthos", "horse mussels") ~ "invert",
+      common_name %in% c(
+        "Fucus spiralis", "Fucus distichus", "Particulate Organic Matter", "eelgrass", "sea water", "Green algae", "zooplankton", "Plankton", "Brown algae") ~ "water",
+      common_name %in% c(
+        "sediment") ~ "sediment",
+      common_name %in% c(
+        "Harbor seal", "Pacific harbor seal", "River otters", "osprey", "Cormorant egg", "Heron egg", "heron eggs", "Great blue heron eggs", "river otter", "blue heron", "double-crested cormorants", "pelagic cormorants", "California sea lion", "Steller sea lion") ~ "pinniped",
+      common_name %in% c(
+        "osprey", "Cormorant egg", "Heron egg", "heron eggs", "Great blue heron eggs", "blue heron", "double-crested cormorants", "pelagic cormorants") ~ "bird",
+      TRUE ~ common_name))
+
+master_congeners <- master_congeners %>%
+  separate_rows(PCB_congener, sep = "\\s*,\\s*")
+```
+
+
+
+Matching the mixture congeners to the individual congener based concentrations to recreate the mixtures. Adding the individual congeners in each mixture up to find the proportion of target congeners. Using those proportions, estimate the concentration of the target congeners in each known mixture. Including 129 in the 138 measurements because they coelute and several studies list the 138 concentration under 129 because it is a lower number.
+```{r}
+master_congeners <- master_congeners %>%
+  mutate(
+    concentration_mix = mapply(
+      function(tab, congener) {
+        i <- which(
+  mixtures$mixtures_tab == tab &
+  (as.character(mixtures$`IUPAC Number`) == as.character(congener) |
+    (as.character(congener) == "138" &
+      as.character(mixtures$`IUPAC Number`) == "129")))
+        if (length(i) == 0) {
+          NA_real_} else {
+          sum(as.numeric(mixtures$Concentrations[i]), na.rm = TRUE)}},
+      mixtures_tab,
+      PCB_congener))
+
+mixture_summary <- master_congeners %>%
+  mutate(
+    PCB_congener = trimws(as.character(PCB_congener))) %>%
+  group_by(citation, common_name, mixtures_tab) %>%
+  summarise(
+    congener_list = paste(unique(PCB_congener), collapse = ", "),
+    mixture_total = sum(concentration_mix, na.rm = TRUE),
+    congener_118 = sum(
+      concentration_mix[PCB_congener == "118"],
+      na.rm = TRUE),
+    congener_138 = sum(
+      concentration_mix[PCB_congener %in% c("138", "129")],
+      na.rm = TRUE),
+    congener_153 = sum(
+      concentration_mix[PCB_congener == "153"],
+      na.rm = TRUE),
+    .groups = "drop") %>%
+  mutate(
+    proportion_118 = congener_118 / mixture_total,
+    proportion_138 = congener_138 / mixture_total,
+    proportion_153 = congener_153 / mixture_total)
+
+concentration_lookup <- master_congeners %>%
+  select(citation, common_name, mixtures_tab, concentration_mgm3) %>%
+  distinct()
+
+concentration_lookup %>%
+  count(citation, common_name, mixtures_tab) %>%
+  filter(n > 1)
+mixture_summary <- mixture_summary %>%
+  left_join(
+    concentration_lookup,
+    by = c("citation", "common_name", "mixtures_tab"))
+
+mixture_summary <- mixture_summary %>%
+  mutate(
+    conc118 = concentration_mgm3 * proportion_118,
+    conc138 = concentration_mgm3 * proportion_138,
+    conc153 = concentration_mgm3 * proportion_153)
+
+
+```
+
+
+Proportion of target congeners in mixures with all 209. Including coelute 129 with 138 because several tabs list the 129/138/160/163 concentration in the 129 row.
+```{r}
+mixture_proportions <- mixtures %>%
+  mutate(
+    IUPAC = as.character(`IUPAC Number`),
+    concentration = as.numeric(Concentrations)) %>%
+  filter(grepl("^[0-9]+$", IUPAC)) %>%
+  mutate(IUPAC = as.integer(IUPAC)) %>%
+  filter(IUPAC >= 1, IUPAC <= 209) %>%
+  group_by(mixtures_tab) %>%
+  summarise(
+    total_congener_concentration = sum(concentration, na.rm = TRUE),
+    conc118 = sum(concentration[IUPAC == 118], na.rm = TRUE),
+    conc138 = sum(concentration[IUPAC %in% c("138", "129")], na.rm = TRUE),
+    conc153 = sum(concentration[IUPAC == 153], na.rm = TRUE),
+    .groups = "drop") %>%
+  mutate(
+    prop118 = conc118 / total_congener_concentration,
+    prop138 = conc138 / total_congener_concentration,
+    prop153 = conc153 / total_congener_concentration)
+```
+
+Using props of target congeners to estimate concentration of targets in mixtures with all 209 congeners.
+
+Filtering dataset and grouping similar species
+```{r}
+total_209 <- master %>%
+  filter(pcb_type == "Total PCB (209 congeners)") %>%
+  select(
+    citation,
+    common_name,
+    PCB_congener,
+    no_congener,
+    congeners_analyzed,
+    concentration_mgm3
+  ) %>%
+  distinct()
+
+unique(total_209$common_name)
+
+total_species <- total_209 %>%
+  mutate(
+    mixtures_tab = case_when(
+      common_name %in% c(
+        "Southern Resident killer whale", "Transient killer whale") ~ "whale",
+      common_name %in% c(
+        "Chinook", "Rockfish", "Pacific lingcod", "English sole", "Pacific tomcod", "Pacific hake", "Pacific herring", "Pacific midshipman", "Pacific sand lance", "Sockeye", "Irish Lord", "Midshipman", "salmon") ~ "fish",
+      common_name %in% c(
+        "crab", "Ghost shrimp", "Spot prawn", "Butter Clam", "Benthic invertebrates", "mussel", "whole benthos", "echinoderm", "horse mussel", "scallops", "Subtidal bivalves", "Heteromastus", "Polychaete", "Cerebratulus", "intertidal clams", "Blue mussel", "horse mussels") ~ "invert",
+      common_name %in% c(
+        "Harbor seal") ~ "pinniped",
+      common_name %in% c(
+        "Great blue heron eggs") ~ "bird",
+      common_name %in% c(
+        "zooplankton") ~ "water",
+      TRUE ~ common_name))
+
+```
+
+Finding target concentrations in mixtures with all congeners.
+```{r}
+target_props <- mixture_proportions %>%
+  select(prop118, prop138, prop153, mixtures_tab) %>%
+  distinct()
+
+target_props_209 <- total_species %>%
+  left_join(
+    target_props,
+    by = c("mixtures_tab"))
+
+target_props_209 <- target_props_209 %>%
+  mutate(
+    conc118 = concentration_mgm3 * prop118,
+    conc138 = concentration_mgm3 * prop138,
+    conc153 = concentration_mgm3 * prop153)
+```
+
+
+
+
+Estimating targets in unknown mixtures
+
+Filtering and sorting unknown mixtures
+```{r}
+unknown <- master %>%
+  filter(pcb_type == "Unknown mixture") %>%
+  select(
+    citation,
+    common_name,
+    PCB_congener,
+    no_congener,
+    congeners_analyzed,
+    concentration_mgm3
+  ) %>%
+  distinct()
+
+unique(unknown$common_name)
+
+unknown <- unknown %>%
+  mutate(
+    mixtures_tab = case_when(
+      common_name %in% c(
+        "Southern Resident killer whale", "Transient killer whale", "Northern Resident killer whale", "Offshore") ~ "whale",
+      common_name %in% c(
+        "English sole", "ratfish", "Rock sole", "sand sole", "shiner surf perch", "staghorn sculpin", "Chinook", "Sockeye", "Coho", "Pacific herring") ~ "fish",
+      common_name %in% c(
+        "crab", "sea cucumber", "mussels", "Crab") ~ "invert",
+      common_name %in% c(
+        "Harbor seal", "River otters") ~ "pinniped",
+      common_name %in% c(
+        "zooplankton", "eelgrass", "Fucus distichus", "Fucus spiralis") ~ "water",
+      TRUE ~ common_name))
+```
+
+Concentrations of targets in unknown mixtures
+```{r}
+target_props_unknown <- unknown %>%
+  left_join(
+    target_props,
+    by = c("mixtures_tab"))
+
+unknown_targets <- target_props_unknown %>%
+  mutate(
+    conc118 = concentration_mgm3 * prop118,
+    conc138 = concentration_mgm3 * prop138,
+    conc153 = concentration_mgm3 * prop153)
+```
+
+
+Estimating targets in Aroclor mixtures
+
+Filtering and sorting
+```{r}
+aroclors <- master %>%
+  filter(pcb_type == "Aroclor mixture") %>%
+  select(
+    citation,
+    common_name,
+    PCB_congener,
+    no_congener,
+    congeners_analyzed,
+    concentration_mgm3
+  ) %>%
+  distinct()
+
+unique(aroclors$common_name)
+
+aroclors <- aroclors %>%
+  mutate(
+    mixtures_tab = case_when(
+      common_name %in% c(
+        "Rockfish", "English sole", "Chinook/coho salmon", "Quillback rockfish", "Pacific herring", "Chinook", "Quillback rockfish (Sebastes maliger), brown rockfish (S.auriculatus) and copper rockfish (S. caurinus)") ~ "fish",
+      common_name %in% c(
+        "river otter") ~ "pinniped",
+      TRUE ~ common_name))
+```
+
+Estimating concentrations using 2 different methods
+```{r}
+
+#Assuming similar target proportions to other mixtures
+target_props_aroclors <- aroclors %>%
+  left_join(
+    target_props,
+    by = c("mixtures_tab"))
+
+aroclor_targets <- target_props_aroclors %>%
+  mutate(
+    conc118 = concentration_mgm3 * prop118,
+    conc138 = concentration_mgm3 * prop138,
+    conc153 = concentration_mgm3 * prop153)
+
+
+#Using Frame Aroclor profiles
+
+view(aroclor_profile)
+sort(unique(aroclors$PCB_congener))
+
+aroclors <- aroclors %>%
+  mutate(
+    prop118 = case_when(
+      PCB_congener == "Aroclor1016" ~ aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1016"],
+      PCB_congener == "Aroclor1221" ~ aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1221"],
+      PCB_congener == "Aroclor1232" ~ aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1232"],
+      PCB_congener == "Aroclor1242" ~ aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1242"],
+      PCB_congener == "Aroclor1248" ~ aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1248"],
+      PCB_congener == "Aroclor1254" ~ aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+      PCB_congener == "Aroclor1260" ~ aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"],
+      PCB_congener == "Aroclor1268" ~ aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"],
+      PCB_congener %in%  c("Aroclor1254,1260", "Aroclor1254:1260", "Aroclor1254:1260,PCBs126,169") ~ mean(c(
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"]), na.rm = TRUE),
+      PCB_congener == "Aroclor1016,1221,1232,1242,1248,1254,1260" ~ mean(c(
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1016"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1221"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1232"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1242"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1248"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"]), na.rm = TRUE),
+      PCB_congener == "Aroclor1016,1221,1232,1242,1248,1254,1260,1268" ~ mean(c(
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1016"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1221"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1232"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1242"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1248"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+        aroclor_profile$`118 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"]), na.rm = TRUE),
+      TRUE ~ NA_real_),
+
+    prop138 = case_when(
+      PCB_congener == "Aroclor1016" ~ aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1016"],
+      PCB_congener == "Aroclor1221" ~ aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1221"],
+      PCB_congener == "Aroclor1232" ~ aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1232"],
+      PCB_congener == "Aroclor1242" ~ aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1242"],
+      PCB_congener == "Aroclor1248" ~ aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1248"],
+      PCB_congener == "Aroclor1254" ~ aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+      PCB_congener == "Aroclor1260" ~ aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"],
+      PCB_congener == "Aroclor1268" ~ aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"],
+      PCB_congener %in%  c("Aroclor1254,1260", "Aroclor1254:1260", "Aroclor1254:1260,PCBs126,169") ~ mean(c(
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"]), na.rm = TRUE),
+      PCB_congener == "Aroclor1016,1221,1232,1242,1248,1254,1260" ~ mean(c(
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1016"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1221"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1232"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1242"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1248"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"]), na.rm = TRUE),
+      PCB_congener == "Aroclor1016,1221,1232,1242,1248,1254,1260,1268" ~ mean(c(
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1016"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1221"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1232"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1242"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1248"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+        aroclor_profile$`138 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"]), na.rm = TRUE),
+      TRUE ~ NA_real_),
+
+    prop153 = case_when(
+      PCB_congener == "Aroclor1016" ~ aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1016"],
+      PCB_congener == "Aroclor1221" ~ aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1221"],
+      PCB_congener == "Aroclor1232" ~ aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1232"],
+      PCB_congener == "Aroclor1242" ~ aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1242"],
+      PCB_congener == "Aroclor1248" ~ aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1248"],
+      PCB_congener == "Aroclor1254" ~ aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+      PCB_congener == "Aroclor1260" ~ aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"],
+      PCB_congener == "Aroclor1268" ~ aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"],
+      PCB_congener %in%  c("Aroclor1254,1260", "Aroclor1254:1260", "Aroclor1254:1260,PCBs126,169") ~ mean(c(
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"]), na.rm = TRUE),
+      PCB_congener == "Aroclor1016,1221,1232,1242,1248,1254,1260" ~ mean(c(
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1016"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1221"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1232"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1242"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1248"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"]), na.rm = TRUE),
+      PCB_congener == "Aroclor1016,1221,1232,1242,1248,1254,1260,1268" ~ mean(c(
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1016"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1221"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1232"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1242"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1248"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1254"],
+        aroclor_profile$`153 weight prop`[aroclor_profile$Aroclor == "Aroclor 1260"]), na.rm = TRUE),
+      TRUE ~ NA_real_))
+
+aroclor_targ <- aroclors %>%
+  mutate(
+    conc118 = concentration_mgm3 * prop118,
+    conc138 = concentration_mgm3 * prop138,
+    conc153 = concentration_mgm3 * prop153)
+```
+
+More concise code for assuming constant target proportions in all mixture types. **Use with caution** This includes individual congeners, known mixtures, unknown mixtures, and total congeners, so it is less accurate.
+```{r}
+unique(master$functional_group)
+tot_209 <- master %>%
+  filter(pcb_type == "") %>%
+  select(
+    citation,
+    common_name,
+    PCB_congener,
+    no_congener,
+    congeners_analyzed,
+    concentration_mgm3
+  ) %>%
+  distinct()
+
+similar_species <- tot_209 %>%
+  mutate(
+    mixtures_tab = case_when(
+      functional_group %in% c("NA", "ROR", "TOR", "HUW") ~ "whale",
+      functional_group %in% c("Chum", "Coho", "Chinook", "Chinook hatchery", "Hatchery Chinook", "Chinook. hatchery", "Fish", "SAL", "RAT", "ROC", "Chinook/Coho", "DOG", "HE", "ROC, MRO, DVR, MVR", "FVS", "FDF", "SMD", "FMM", "FPS", "POP", "SBL", "HE/POP/FPS", "SMD/POP/FDF", "SP", "HEP", "HEC", "PIS") ~ "fish",
+      functional_group %in% c("BIV", "DUN", "BIV,BC,BMD", "PWN", "BML", "BC, BML, PWN, BFF, BIV", "BD", "BG", "BC", "GEC", "BMD", "BIV, BD, BG, BC") ~ "invert",
+      functional_group %in% c("sea water", "ZM, ZL, ZS", "ZM, ZL, ZG", "ZL, ZM", "ZL", "MA", "ZM/ ZL/ ZG", "SG") ~ "water",
+      functional_group %in% c("sediment", "detritus") ~ "sediment",
+      functional_group %in% c("HSL", "Otter", "CSL", "PIN") ~ "pinniped",
+      functional_group %in% c("SB") ~ "bird",
+      TRUE ~ functional_group))
+
+all_targets <- similar_species %>%
+  left_join(
+    target_props,
+    by = c("mixtures_tab"))
+
+all_targets <- all_targets %>%
+  mutate(
+    conc118 = concentration_mgm3 * prop118,
+    conc138 = concentration_mgm3 * prop138,
+    conc153 = concentration_mgm3 * prop153)
+```
+
+

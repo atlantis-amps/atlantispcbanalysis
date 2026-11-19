@@ -5,7 +5,6 @@ output: html_notebook
 
 Extract tables from PDF files
 ```{r}
-
 this.name <- "Liedtke_Conn_2021"
 this.pdf <- here::here("inputs","concentrations","Liedtke_Conn_2021_Table1.pdf")
 tables.file <- tabulapdf::extract_areas(this.pdf)
